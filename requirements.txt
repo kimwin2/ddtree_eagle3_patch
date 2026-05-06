@@ -1,5 +1,7 @@
 torch
 transformers
+huggingface_hub
+safetensors
 datasets
 flash-attn
 numpy

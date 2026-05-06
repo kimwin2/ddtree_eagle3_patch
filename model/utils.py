@@ -34,6 +34,21 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
+def get_final_logit_softcapping(config) -> Optional[float]:
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    value = dflash_config.get("final_logit_softcapping", getattr(config, "final_logit_softcapping", None))
+    if value is None:
+        return None
+    return float(value)
+
+def apply_final_logit_softcapping(
+    logits: torch.Tensor,
+    final_logit_softcapping: Optional[float],
+) -> torch.Tensor:
+    if final_logit_softcapping is None:
+        return logits
+    return torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
+
 def load_and_process_dataset(data_name: str):
     # Math datasets
     if data_name == "gsm8k":

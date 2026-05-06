@@ -8,7 +8,12 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, DynamicCache
 
-from model import DFlashDraftModel, sample, extract_context_feature
+from model import (
+    DFlashDraftModel,
+    apply_final_logit_softcapping,
+    sample,
+    extract_context_feature,
+)
 from dflash import dflash_generate, cuda_time, empty_stage_times
 
 
@@ -370,6 +375,7 @@ def ddtree_generate(
             use_cache=True,
             is_causal=False,
         )[:, -draft_horizon:, :])
+        draft_logits = apply_final_logit_softcapping(draft_logits, model.final_logit_softcapping)
         past_key_values_draft.crop(start)
         draft_stage_elapsed = cuda_time() - draft_stage_start
         if draft_prefill:

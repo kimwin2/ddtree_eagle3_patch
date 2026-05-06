@@ -31,6 +31,21 @@ bash run_benchmark.sh
 
 This produces benchmark outputs in `runs/` and logs in `logs/`.
 
+For Eagle3 draft models, put an Eagle3 pair in `MODEL_DRAFT_PAIRS`; `run_benchmark.sh`
+will switch to the Eagle3 path automatically when the draft name contains `eagle3`.
+
+```bash
+MODEL_DRAFT_PAIRS=(
+  "Qwen/Qwen3-4B|AngelSlim/Qwen3-4B_eagle3"
+)
+```
+
+The default Eagle3 settings are batch size 1, depth 7, top-k 8, and tree size 32.
+They can be overridden either through `benchmark.py` args
+(`--eagle3-batch-size`, `--eagle3-depth`, `--eagle3-topk`, `--eagle3-tree-size`)
+or through `run_benchmark.sh` environment variables
+(`EAGLE3_BATCH_SIZE`, `EAGLE3_DEPTH`, `EAGLE3_TOPK`, `EAGLE3_TREE_SIZE`).
+
 ## Reproduce Paper Artifacts
 
 Generate the plots:

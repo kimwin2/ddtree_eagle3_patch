@@ -17,7 +17,13 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from transformers import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
-from .utils import build_target_layer_ids, extract_context_feature, sample
+from .utils import (
+    apply_final_logit_softcapping,
+    build_target_layer_ids,
+    extract_context_feature,
+    get_final_logit_softcapping,
+    sample,
+)
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -161,6 +167,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = self.config.dflash_config.get("mask_token_id", None)
+        self.final_logit_softcapping = get_final_logit_softcapping(config)
         self.post_init()
 
     def forward(
@@ -243,6 +250,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 is_causal=False,
             )[:, -block_size+1:, :])
+            draft_logits = apply_final_logit_softcapping(draft_logits, self.final_logit_softcapping)
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
 

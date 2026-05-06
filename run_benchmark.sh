@@ -8,6 +8,10 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 MASTER_PORT="${MASTER_PORT:-29600}"
 LOG_DIR="${LOG_DIR:-logs}"
 RUN_DIR="${RUN_DIR:-runs}"
+EAGLE3_BATCH_SIZE="${EAGLE3_BATCH_SIZE:-1}"
+EAGLE3_DEPTH="${EAGLE3_DEPTH:-7}"
+EAGLE3_TOPK="${EAGLE3_TOPK:-8}"
+EAGLE3_TREE_SIZE="${EAGLE3_TREE_SIZE:-32}"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 
@@ -45,6 +49,12 @@ slugify() {
   value="${value//:/_}"
   value="${value// /_}"
   echo "$value"
+}
+
+is_eagle3_draft() {
+  local draft_name="$1"
+  local lower="${draft_name,,}"
+  [[ "${lower}" == *"eagle3"* ]]
 }
 
 run_benchmark() {
@@ -92,26 +102,44 @@ for task in "${TASKS[@]}"; do
       temperature_slug="$(slugify "${temperature}")"
       run_name="${dataset_name}__${model_slug}__${draft_slug}__temp${temperature_slug}"
 
-      run_benchmark \
-        "${dataset_name}" \
-        "${max_samples}" \
-        "${model_name}" \
-        "${draft_name}" \
-        "sdpa" \
-        "${RUN_DIR}/${run_name}__sdpa.pt" \
-        "${LOG_DIR}/${run_name}__sdpa.log" \
-        --temperature "${temperature}"
+      if is_eagle3_draft "${draft_name}"; then
+        eagle3_mode="eagle3_b${EAGLE3_BATCH_SIZE}_d${EAGLE3_DEPTH}_k${EAGLE3_TOPK}_t${EAGLE3_TREE_SIZE}"
+        run_benchmark \
+          "${dataset_name}" \
+          "${max_samples}" \
+          "${model_name}" \
+          "${draft_name}" \
+          "${eagle3_mode}" \
+          "${RUN_DIR}/${run_name}__${eagle3_mode}.pt" \
+          "${LOG_DIR}/${run_name}__${eagle3_mode}.log" \
+          --temperature "${temperature}" \
+          --draft-algorithm eagle3 \
+          --eagle3-batch-size "${EAGLE3_BATCH_SIZE}" \
+          --eagle3-depth "${EAGLE3_DEPTH}" \
+          --eagle3-topk "${EAGLE3_TOPK}" \
+          --eagle3-tree-size "${EAGLE3_TREE_SIZE}"
+      else
+        run_benchmark \
+          "${dataset_name}" \
+          "${max_samples}" \
+          "${model_name}" \
+          "${draft_name}" \
+          "sdpa" \
+          "${RUN_DIR}/${run_name}__sdpa.pt" \
+          "${LOG_DIR}/${run_name}__sdpa.log" \
+          --temperature "${temperature}"
 
-      run_benchmark \
-        "${dataset_name}" \
-        "${max_samples}" \
-        "${model_name}" \
-        "${draft_name}" \
-        "flash_attn" \
-        "${RUN_DIR}/${run_name}__flash_attn.pt" \
-        "${LOG_DIR}/${run_name}__flash_attn.log" \
-        --temperature "${temperature}" \
-        --flash-attn
+        run_benchmark \
+          "${dataset_name}" \
+          "${max_samples}" \
+          "${model_name}" \
+          "${draft_name}" \
+          "flash_attn" \
+          "${RUN_DIR}/${run_name}__flash_attn.pt" \
+          "${LOG_DIR}/${run_name}__flash_attn.log" \
+          --temperature "${temperature}" \
+          --flash-attn
+      fi
     done
   done
 done

@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import torch
 from transformers import AutoModelForCausalLM, DynamicCache
 
-from model import DFlashDraftModel, sample, extract_context_feature
+from model import (
+    DFlashDraftModel,
+    apply_final_logit_softcapping,
+    sample,
+    extract_context_feature,
+)
 
 
 DFLASH_STAGE_ORDER = ("draft", "verify", "commit")
@@ -75,6 +80,7 @@ def dflash_generate(
                 use_cache=True,
                 is_causal=False,
             )[:, -block_size + 1 :, :])
+            draft_logits = apply_final_logit_softcapping(draft_logits, model.final_logit_softcapping)
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
             draft_stage_elapsed = cuda_time() - draft_stage_start
