@@ -24,6 +24,31 @@ DDTREE_TREE_BUILD_STAGE_ORDER = ("tree_build_copy", "tree_build_heap", "tree_bui
 _CPP_COMPACT_ENABLED = False
 
 
+def detect_hybrid_attention(target) -> tuple[list[str] | None, int | None]:
+    """Detect hybrid sliding-window + full attention layout (e.g. Gemma 3/4).
+
+    Returns ``(layer_types, sliding_window)`` when the target model interleaves
+    ``sliding_attention`` and ``full_attention`` layers, ``(None, None)`` otherwise.
+
+    The text-tower of multimodal models (e.g. ``Gemma4ForConditionalGeneration``)
+    keeps the relevant fields under ``config.text_config``; we fall back to the
+    flat config for text-only models.
+    """
+    cfg = getattr(target, "config", None)
+    if cfg is None:
+        return None, None
+    text_cfg = getattr(cfg, "text_config", None) or cfg
+    layer_types = getattr(text_cfg, "layer_types", None)
+    sliding_window = getattr(text_cfg, "sliding_window", None)
+    if not layer_types or sliding_window is None:
+        return None, None
+    if int(sliding_window) <= 0:
+        return None, None
+    if "sliding_attention" not in layer_types or "full_attention" not in layer_types:
+        return None, None
+    return list(layer_types), int(sliding_window)
+
+
 @lru_cache(maxsize=1)
 def load_cpp_compact_module():
     try:
@@ -186,7 +211,20 @@ def compile_ddtree_tree(
     tree_visibility_buffer: torch.Tensor,
     previous_tree_start: int,
     previous_tree_length: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    sliding_window: int | None = None,
+    sliding_attention_mask_buffer: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | dict[str, torch.Tensor]", int, int]:
+    """Compile draft tree into ``(input_ids, position_ids, attention_mask, ...)``.
+
+    When ``sliding_window`` is provided alongside ``sliding_attention_mask_buffer``,
+    the returned ``attention_mask`` is a ``dict`` keyed by layer-type
+    (``"full_attention"`` and ``"sliding_attention"``), suitable for hybrid models
+    such as Gemma 3/4. The ``full_attention`` mask matches the original behaviour
+    (entire past visible). The ``sliding_attention`` mask additionally masks out
+    past tokens that fall outside the sliding window for each query row.
+
+    Otherwise the function returns a single 4D mask tensor as before.
+    """
     current_length = 1 + int(node_token_ids.numel())
 
     if previous_tree_length > 0:
@@ -206,11 +244,46 @@ def compile_ddtree_tree(
     visibility = tree_visibility_buffer[:current_length, :current_length]
     visibility.copy_(visibility_cpu, non_blocking=False)
 
+    min_value = torch.finfo(dtype).min
+
     tree_block = attention_mask_buffer[0, 0, :current_length, past_length : past_length + current_length]
-    tree_block.fill_(torch.finfo(dtype).min)
+    tree_block.fill_(min_value)
     tree_block.masked_fill_(visibility, 0)
 
-    attention_mask = attention_mask_buffer[:, :, :current_length, : past_length + current_length]
+    full_attention_mask = attention_mask_buffer[:, :, :current_length, : past_length + current_length]
+
+    if sliding_window is None or sliding_attention_mask_buffer is None:
+        return verify_input_ids, verify_position_ids, full_attention_mask, past_length, current_length
+
+    # Hybrid path: build a separate mask whose past portion respects the sliding
+    # window. The tree portion is identical to the full-attention mask because
+    # tree depth (<= block_size) is far smaller than typical window sizes.
+    sliding_tree_block = sliding_attention_mask_buffer[0, 0, :current_length, past_length : past_length + current_length]
+    sliding_tree_block.fill_(min_value)
+    sliding_tree_block.masked_fill_(visibility, 0)
+
+    sliding_past_block = sliding_attention_mask_buffer[0, 0, :current_length, :past_length]
+    sliding_past_block.zero_()
+    if past_length > 0:
+        # Each query row d attends to keys whose positions fall in
+        # [query_pos[d] - window + 1, query_pos[d]]. Row 0 is the bonus token at
+        # sequence position == start; subsequent rows are at start + node_depths.
+        query_positions = torch.empty(current_length, dtype=torch.long, device=device)
+        query_positions[0] = start
+        if current_length > 1:
+            query_positions[1:].copy_(node_depths, non_blocking=False)
+            query_positions[1:].add_(start)
+        lower_bounds = query_positions - sliding_window + 1
+        past_indices = torch.arange(past_length, device=device)
+        out_of_window = past_indices.unsqueeze(0) < lower_bounds.unsqueeze(1)
+        sliding_past_block.masked_fill_(out_of_window, min_value)
+
+    sliding_attention_mask = sliding_attention_mask_buffer[:, :, :current_length, : past_length + current_length]
+
+    attention_mask = {
+        "full_attention": full_attention_mask,
+        "sliding_attention": sliding_attention_mask,
+    }
     return verify_input_ids, verify_position_ids, attention_mask, past_length, current_length
 
 
@@ -331,6 +404,26 @@ def ddtree_generate(
     )
     tree_visibility_buffer = torch.empty((max_tree_nodes, max_tree_nodes), dtype=torch.bool, device=model.device)
 
+    layer_types, sliding_window = detect_hybrid_attention(target)
+    if sliding_window is not None:
+        # Hybrid models (e.g. Gemma 3/4) need a separate mask for sliding-window
+        # layers whose past portion is bounded by the window. The buffer shape
+        # mirrors ``attention_mask_buffer`` so we can hand both to the model as
+        # a per-layer-type dict during verification.
+        sliding_attention_mask_buffer = torch.zeros(
+            (1, 1, max_tree_nodes, max_length + max_tree_nodes),
+            dtype=target.dtype,
+            device=model.device,
+        )
+        logger.info(
+            f"DDTree detected hybrid attention (sliding_window={sliding_window}, "
+            f"{sum(1 for t in layer_types if t == 'sliding_attention')} sliding / "
+            f"{sum(1 for t in layer_types if t == 'full_attention')} full layers); "
+            f"verify forward will use a per-layer-type attention mask dict."
+        )
+    else:
+        sliding_attention_mask_buffer = None
+
     past_key_values_target = DynamicCache()
     past_key_values_draft = DynamicCache()
     stage_times = empty_stage_times(DDTREE_STAGE_ORDER + DDTREE_TREE_BUILD_STAGE_ORDER)
@@ -408,6 +501,8 @@ def ddtree_generate(
             tree_visibility_buffer=tree_visibility_buffer,
             previous_tree_start=previous_tree_start,
             previous_tree_length=previous_tree_length,
+            sliding_window=sliding_window,
+            sliding_attention_mask_buffer=sliding_attention_mask_buffer,
         )
         stage_times["tree_compile"] += cuda_time() - tree_compile_start
 
