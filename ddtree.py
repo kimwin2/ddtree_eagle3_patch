@@ -332,23 +332,37 @@ def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_
             keep_tensor_by_device[device] = torch.tensor(keep_current_indices, dtype=torch.long, device=device)
         return keep_tensor_by_device[device]
 
-    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
-        for layer_idx in range(len(past_key_values.key_cache)):
-            key_cache = past_key_values.key_cache[layer_idx]
-            value_cache = past_key_values.value_cache[layer_idx]
-            keep_tensor = get_keep_tensor(key_cache.device)
-            _compact_appended_window(key_cache, past_length, keep_tensor)
-            _compact_appended_window(value_cache, past_length, keep_tensor)
+    # Guard against (a) layers that never called cache.update() — Gemma 4's
+    # KV-shared layers leak through here as missing/uninitialized entries — and
+    # (b) the rare case where two layer slots alias the same physical tensor,
+    # which would otherwise be compacted twice and corrupt the trailing window.
+    seen_tensor_ids: set[int] = set()
+
+    def _maybe_compact(tensor: torch.Tensor | None) -> None:
+        if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return
+        tensor_id = id(tensor)
+        if tensor_id in seen_tensor_ids:
+            return
+        seen_tensor_ids.add(tensor_id)
+        keep_tensor = get_keep_tensor(tensor.device)
+        _compact_appended_window(tensor, past_length, keep_tensor)
+
+    # transformers >= 4.50 (and v5.x) exposes the canonical ``.layers`` list.
+    # Prefer that path so we transparently skip uninitialized KV-shared slots.
+    if hasattr(past_key_values, "layers"):
+        for layer in past_key_values.layers:
+            if hasattr(layer, "is_initialized") and not layer.is_initialized:
+                continue
+            _maybe_compact(getattr(layer, "keys", None))
+            _maybe_compact(getattr(layer, "values", None))
         past_key_values.crop(past_length + len(keep_current_indices))
         return
 
-    if hasattr(past_key_values, "layers"):
-        for layer in past_key_values.layers:
-            if not hasattr(layer, "keys") or layer.keys is None or layer.keys.numel() == 0:
-                continue
-            keep_tensor = get_keep_tensor(layer.keys.device)
-            _compact_appended_window(layer.keys, past_length, keep_tensor)
-            _compact_appended_window(layer.values, past_length, keep_tensor)
+    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        for layer_idx in range(len(past_key_values.key_cache)):
+            _maybe_compact(past_key_values.key_cache[layer_idx])
+            _maybe_compact(past_key_values.value_cache[layer_idx])
         past_key_values.crop(past_length + len(keep_current_indices))
         return
 
