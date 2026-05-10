@@ -1,14 +1,71 @@
 from types import SimpleNamespace
 
 import torch
-from transformers import AutoModelForCausalLM, DynamicCache
+from typing import Callable, Optional
 
+import torch
+from torch import nn
+from transformers import AutoModelForCausalLM, DynamicCache
+from transformers.cache_utils import Cache
 from ddtree import compact_dynamic_cache
 from dflash import cuda_time, empty_stage_times
 from model import Eagle3DraftModel, sample
 
 
 EAGLE3_STAGE_ORDER = ("draft", "verify", "commit")
+class _FullStorageSlidingWindowCache(DynamicCache):
+    def __init__(self, sliding_windows: dict[int, int], num_layers: int) -> None:
+        super().__init__()
+        self.sliding_windows = sliding_windows
+        self.num_layers = num_layers
+
+    @property
+    def is_sliding(self):
+        return [i in self.sliding_windows for i in range(self.num_layers)]
+
+    def get_mask_sizes(self, query_length: int, layer_idx: int) -> tuple[int, int]:
+        sliding_window = self.sliding_windows.get(layer_idx)
+        past_len = self.get_seq_length(layer_idx)
+
+        if sliding_window is None:
+            return past_len + query_length, 0
+
+        kv_offset = max(past_len - int(sliding_window) + 1, 0)
+        kv_length = past_len + query_length - kv_offset
+        return kv_length, kv_offset
+
+    def update(self, key_states, value_states, layer_idx: int, cache_kwargs=None):
+        keys, values = super().update(
+            key_states,
+            value_states,
+            layer_idx,
+            cache_kwargs,
+        )
+        sliding_window = self.sliding_windows.get(layer_idx)
+        if sliding_window is None:
+            return keys, values
+
+        current_length = key_states.shape[-2]
+        view_length = min(keys.shape[-2], int(sliding_window) + current_length - 1)
+        return keys[..., -view_length:, :], values[..., -view_length:, :]
+
+def _make_target_cache(target: nn.Module) -> DynamicCache:
+    layers = getattr(getattr(target, "model", None), "layers", None)
+    if layers is None:
+        return DynamicCache()
+
+    sliding_windows: dict[int, int] = {}
+    for layer_idx, layer in enumerate(layers):
+        self_attn = getattr(layer, "self_attn", None)
+        if not getattr(self_attn, "is_sliding", False):
+            continue
+        sliding_window = getattr(self_attn, "sliding_window", None)
+        if sliding_window is not None:
+            sliding_windows[layer_idx] = int(sliding_window)
+
+    if not sliding_windows:
+        return DynamicCache()
+    return _FullStorageSlidingWindowCache(sliding_windows, num_layers=len(layers))
 
 
 def eagle3_target_layer_ids(target_config, draft_model: Eagle3DraftModel) -> list[int]:
@@ -92,13 +149,14 @@ def target_generate(
     position_ids = torch.arange(max_length + 1, device=target.device).unsqueeze(0)
     stop_token_ids_tensor = None if stop_token_ids is None else torch.tensor(stop_token_ids, device=target.device)
 
-    past_key_values = DynamicCache()
+    past_key_values = _make_target_cache(target)
     stage_times = empty_stage_times(("decode",))
 
     prefill_start = cuda_time()
     output = target(
         input_ids,
         position_ids=position_ids[:, :num_input_tokens],
+        cache_position=position_ids[0, :num_input_tokens],
         past_key_values=past_key_values,
         use_cache=True,
         logits_to_keep=1,
@@ -120,6 +178,7 @@ def target_generate(
         output = target(
             next_token,
             position_ids=position_ids[:, current_position : current_position + 1],
+            cache_position=position_ids[0, current_position : current_position + 1],
             past_key_values=past_key_values,
             use_cache=True,
             logits_to_keep=1,
@@ -176,6 +235,7 @@ def eagle3_generate(
     output = target(
         input_ids,
         position_ids=position_ids[:, :num_input_tokens],
+        cache_position=position_ids[0, :num_input_tokens],
         past_key_values=past_key_values_target,
         use_cache=True,
         logits_to_keep=1,
@@ -210,9 +270,16 @@ def eagle3_generate(
         )
 
         verify_stage_start = cuda_time()
+        verify_cache_position = torch.arange(
+            past_length,
+            past_length + draft_tokens.shape[1],
+            dtype=torch.long,
+            device=target.device,
+        )
         output = target(
             draft_tokens,
             position_ids=verify_position_ids,
+            cache_position=verify_cache_position,
             attention_mask=verify_attention_mask,
             past_key_values=past_key_values_target,
             use_cache=True,

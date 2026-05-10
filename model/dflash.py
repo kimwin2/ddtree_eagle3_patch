@@ -274,8 +274,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
             ):
                 break
-        output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
+        valid_length = min(max_length, start + 1)
+        output_ids = output_ids[:, :valid_length]
         if stop_token_ids is not None:
             stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
             stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
