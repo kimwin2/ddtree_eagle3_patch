@@ -11,6 +11,8 @@ from transformers import AutoModelForCausalLM, DynamicCache
 from model import (
     DFlashDraftModel,
     apply_final_logit_softcapping,
+    compute_target_lm_logits,
+    embed_target_input_ids,
     sample,
     extract_context_feature,
 )
@@ -259,13 +261,29 @@ def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_
             keep_tensor_by_device[device] = torch.tensor(keep_current_indices, dtype=torch.long, device=device)
         return keep_tensor_by_device[device]
 
+    seen_cache_views: set[tuple[int, int, tuple[int, ...], tuple[int, ...]]] = set()
+
+    def cache_view_key(cache_tensor: torch.Tensor) -> tuple[int, int, tuple[int, ...], tuple[int, ...]]:
+        return (
+            cache_tensor.untyped_storage().data_ptr(),
+            cache_tensor.storage_offset(),
+            tuple(cache_tensor.shape),
+            tuple(cache_tensor.stride()),
+        )
+
     if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
         for layer_idx in range(len(past_key_values.key_cache)):
             key_cache = past_key_values.key_cache[layer_idx]
             value_cache = past_key_values.value_cache[layer_idx]
+            if key_cache is None or value_cache is None or key_cache.numel() == 0:
+                continue
             keep_tensor = get_keep_tensor(key_cache.device)
-            _compact_appended_window(key_cache, past_length, keep_tensor)
-            _compact_appended_window(value_cache, past_length, keep_tensor)
+            for cache_tensor in (key_cache, value_cache):
+                view_key = cache_view_key(cache_tensor)
+                if view_key in seen_cache_views:
+                    continue
+                seen_cache_views.add(view_key)
+                _compact_appended_window(cache_tensor, past_length, keep_tensor)
         past_key_values.crop(past_length + len(keep_current_indices))
         return
 
@@ -274,8 +292,12 @@ def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_
             if not hasattr(layer, "keys") or layer.keys is None or layer.keys.numel() == 0:
                 continue
             keep_tensor = get_keep_tensor(layer.keys.device)
-            _compact_appended_window(layer.keys, past_length, keep_tensor)
-            _compact_appended_window(layer.values, past_length, keep_tensor)
+            for cache_tensor in (layer.keys, layer.values):
+                view_key = cache_view_key(cache_tensor)
+                if view_key in seen_cache_views:
+                    continue
+                seen_cache_views.add(view_key)
+                _compact_appended_window(cache_tensor, past_length, keep_tensor)
         past_key_values.crop(past_length + len(keep_current_indices))
         return
 
@@ -366,8 +388,8 @@ def ddtree_generate(
         root_token = block_output_ids[:, :1]
 
         draft_stage_start = cuda_time()
-        noise_embedding = target.model.embed_tokens(block_output_ids)
-        draft_logits = target.lm_head(model(
+        noise_embedding = embed_target_input_ids(target, block_output_ids)
+        draft_logits = compute_target_lm_logits(target, model(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
             position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],

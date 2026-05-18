@@ -96,6 +96,8 @@ def main() -> None:
             attn_implementation=draft_attn_implementation,
             dtype=torch.bfloat16,
         ).to(device).eval()
+        if hasattr(draft_model, "configure_for_target"):
+            draft_model.configure_for_target(target)
         block_size = args.block_size if args.block_size is not None else draft_model.block_size
         tree_budgets = [int(tree_budget) for tree_budget in args.tree_budget.split(",")]
         methods_to_run = ["dflash"]

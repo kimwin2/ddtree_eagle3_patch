@@ -7,6 +7,8 @@ from transformers import AutoModelForCausalLM, DynamicCache
 from model import (
     DFlashDraftModel,
     apply_final_logit_softcapping,
+    compute_target_lm_logits,
+    embed_target_input_ids,
     sample,
     extract_context_feature,
 )
@@ -71,8 +73,8 @@ def dflash_generate(
         block_position_ids = position_ids[:, start : start + block_size]
         if block_size > 1:
             draft_stage_start = cuda_time()
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(model(
+            noise_embedding = embed_target_input_ids(target, block_output_ids)
+            draft_logits = compute_target_lm_logits(target, model(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],
