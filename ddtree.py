@@ -1,4 +1,5 @@
 import heapq
+import os
 import time
 from functools import lru_cache
 from types import SimpleNamespace
@@ -87,6 +88,56 @@ def maybe_enable_cpp_compact(enabled: bool) -> None:
     _CPP_COMPACT_ENABLED = enabled
     if enabled:
         load_cpp_compact_module()
+
+
+_DDTREE_DEBUG_STATE = {"call": -1, "dumped": 0}
+
+
+def ddtree_debug_begin_call() -> None:
+    """Mark a new ddtree_generate invocation (call 0 is the benchmark warmup)."""
+    _DDTREE_DEBUG_STATE["call"] += 1
+
+
+def ddtree_debug_dump_draft_logits(round_idx: int, draft_logits: torch.Tensor) -> None:
+    """Dump the DDTree draft logits (the tree input) for cross-framework comparison.
+
+    Enabled by the DFLASH_DEBUG_DUMP env var (output directory). Saves the full
+    logits tensor plus per-position argmax and top-k token ids / log-softmax
+    probs. Matching argmax but differing lower-rank log-probs across HF and vLLM
+    is the signature of the framework-numerics divergence that DDTree amplifies
+    (DFlash only consumes the argmax, so it stays in sync; DDTree builds the tree
+    from the full distribution). Files are tagged callNN so the warmup invocation
+    (call00) is distinguishable from the real run (call01+).
+    """
+    dump_dir = os.environ.get("DFLASH_DEBUG_DUMP")
+    if not dump_dir:
+        return
+    if _DDTREE_DEBUG_STATE["dumped"] >= int(os.environ.get("DFLASH_DEBUG_LIMIT", "8")):
+        return
+    _DDTREE_DEBUG_STATE["dumped"] += 1
+    call_idx = _DDTREE_DEBUG_STATE["call"]
+    logits = draft_logits.detach().float()
+    if logits.dim() == 3:
+        logits = logits[0]
+    k = min(10, int(logits.shape[-1]))
+    top_logits, top_token_ids = torch.topk(logits, k=k, dim=-1)
+    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+    top_log_probs = top_logits - log_z
+    tag = f"call{call_idx:02d}_round{round_idx}"
+    summary = {
+        "framework": "hf",
+        "tag": tag,
+        "shape": tuple(draft_logits.shape),
+        "dtype": str(draft_logits.dtype),
+        "argmax": logits.argmax(dim=-1).tolist(),
+        "top_token_ids": top_token_ids.tolist(),
+        "top_log_probs": [[round(value, 5) for value in row] for row in top_log_probs.tolist()],
+    }
+    print(f"[DDTREE-DEBUG] {summary}", flush=True)
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(dump_dir, f"hf_draft_logits_{tag}.pt")
+    torch.save({"summary": summary, "draft_logits": draft_logits.detach().cpu()}, path)
+    print(f"[DDTREE-DEBUG] saved {path}", flush=True)
 
 
 def build_ddtree_tree(
@@ -453,6 +504,8 @@ def ddtree_generate(
             debug_mismatch_log_limit=debug_mismatch_log_limit,
         )
 
+    ddtree_debug_begin_call()
+
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
     draft_horizon = block_size - 1
@@ -540,6 +593,7 @@ def ddtree_generate(
             is_causal=False,
         )[:, -draft_horizon:, :])
         draft_logits = apply_logit_processing(draft_logits, model.logit_scale, model.final_logit_softcapping)
+        ddtree_debug_dump_draft_logits(len(acceptance_lengths), draft_logits)
         past_key_values_draft.crop(start)
         draft_stage_elapsed = cuda_time() - draft_stage_start
         if draft_prefill:
