@@ -23,6 +23,7 @@ from dflash import dflash_generate, cuda_time, empty_stage_times, format_top_log
 
 DDTREE_STAGE_ORDER = ("draft", "tree_build", "tree_compile", "verify", "commit")
 DDTREE_TREE_BUILD_STAGE_ORDER = ("tree_build_copy", "tree_build_heap", "tree_build_visibility")
+GEMMA4_DDTREE_MAX_ACCEPT_TOKENS = 8
 
 
 _CPP_COMPACT_ENABLED = False
@@ -547,7 +548,8 @@ def ddtree_generate(
             replay_target_hidden_chunks = []
             accepted_count = 1
             next_token = None
-            for token_offset in range(tentative_tokens.shape[1]):
+            replay_token_count = min(tentative_tokens.shape[1], GEMMA4_DDTREE_MAX_ACCEPT_TOKENS)
+            for token_offset in range(replay_token_count):
                 replay_step_output = target(
                     tentative_tokens[:, token_offset : token_offset + 1],
                     position_ids=position_ids[:, start + token_offset : start + token_offset + 1],
@@ -562,7 +564,7 @@ def ddtree_generate(
                 step_posterior = sample(replay_step_output.logits, temperature)
                 next_token = int(step_posterior[0, 0].item())
                 next_offset = token_offset + 1
-                if next_offset >= tentative_tokens.shape[1]:
+                if next_offset >= replay_token_count:
                     break
                 if bool((tentative_tokens[0, next_offset] != step_posterior[0, 0]).item()):
                     break
