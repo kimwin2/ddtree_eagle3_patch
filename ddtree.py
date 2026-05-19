@@ -542,24 +542,57 @@ def ddtree_generate(
         tentative_tokens = verify_input_ids.index_select(1, tentative_index_tensor)
 
         past_key_values_target.crop(start)
-        replay_output = target(
-            tentative_tokens,
-            position_ids=position_ids[:, start : start + tentative_tokens.shape[1]],
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            output_hidden_states=True,
-        )
-        replay_posterior = sample(replay_output.logits, temperature)
-        if tentative_tokens.shape[1] > 1:
-            accepted_count = 1 + (
-                tentative_tokens[:, 1:] == replay_posterior[:, :-1]
-            ).cumprod(dim=1).sum(dim=1)[0].item()
-        else:
+        if rebuild_target_cache_each_round:
+            replay_logits = []
+            replay_target_hidden_chunks = []
             accepted_count = 1
+            next_token = None
+            for token_offset in range(tentative_tokens.shape[1]):
+                replay_step_output = target(
+                    tentative_tokens[:, token_offset : token_offset + 1],
+                    position_ids=position_ids[:, start + token_offset : start + token_offset + 1],
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                replay_logits.append(replay_step_output.logits)
+                replay_target_hidden_chunks.append(
+                    extract_context_feature(replay_step_output.hidden_states, model.target_layer_ids)
+                )
+                step_posterior = sample(replay_step_output.logits, temperature)
+                next_token = int(step_posterior[0, 0].item())
+                next_offset = token_offset + 1
+                if next_offset >= tentative_tokens.shape[1]:
+                    break
+                if bool((tentative_tokens[0, next_offset] != step_posterior[0, 0]).item()):
+                    break
+                accepted_count = next_offset + 1
+
+            replay_output = SimpleNamespace(logits=torch.cat(replay_logits, dim=1))
+            replay_target_hidden = torch.cat(replay_target_hidden_chunks, dim=1)
+        else:
+            replay_output = target(
+                tentative_tokens,
+                position_ids=position_ids[:, start : start + tentative_tokens.shape[1]],
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+            replay_posterior = sample(replay_output.logits, temperature)
+            if tentative_tokens.shape[1] > 1:
+                accepted_count = 1 + (
+                    tentative_tokens[:, 1:] == replay_posterior[:, :-1]
+                ).cumprod(dim=1).sum(dim=1)[0].item()
+            else:
+                accepted_count = 1
+            next_token = int(replay_posterior[0, accepted_count - 1].item())
+            replay_target_hidden = extract_context_feature(
+                replay_output.hidden_states,
+                model.target_layer_ids,
+            )[:, :accepted_count, :]
 
         accepted_indices = tentative_accepted_indices[:accepted_count]
         accepted_tokens = tentative_tokens[:, :accepted_count]
-        next_token = int(replay_posterior[0, accepted_count - 1].item())
         past_key_values_target.crop(start + accepted_count)
 
         if debug_expected_output_ids is not None:
@@ -617,7 +650,7 @@ def ddtree_generate(
         output_ids[:, start : start + len(accepted_indices)] = accepted_tokens
         output_ids[:, start + len(accepted_indices)] = next_token
 
-        target_hidden = extract_context_feature(replay_output.hidden_states, model.target_layer_ids)[:, :accepted_count, :]
+        target_hidden = replay_target_hidden
 
         acceptance_lengths.append(len(accepted_indices))
         start += len(accepted_indices)
