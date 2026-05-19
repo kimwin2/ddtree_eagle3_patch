@@ -1,6 +1,9 @@
 import heapq
+import json
+import os
 import time
 from functools import lru_cache
+from pathlib import Path
 from types import SimpleNamespace
 
 from loguru import logger
@@ -25,6 +28,178 @@ DDTREE_TREE_BUILD_STAGE_ORDER = ("tree_build_copy", "tree_build_heap", "tree_bui
 
 
 _CPP_COMPACT_ENABLED = False
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning(f"Ignoring invalid integer value for {name}={value!r}")
+        return default
+
+
+def _ddtree_debug_path() -> Path:
+    rank = os.environ.get("RANK", "0")
+    local_rank = os.environ.get("LOCAL_RANK", rank)
+    template = os.environ.get("DDTREE_DEBUG_JSONL", "ddtree_debug_rank{rank}.jsonl")
+    path_text = template.format(rank=rank, local_rank=local_rank, pid=os.getpid())
+    path = Path(path_text)
+    if "{rank}" not in template and "{local_rank}" not in template and "{pid}" not in template:
+        world_size = _env_int("WORLD_SIZE", 1)
+        if world_size > 1:
+            path = path.with_name(f"{path.stem}.rank{rank}{path.suffix or '.jsonl'}")
+    return path
+
+
+def _write_ddtree_debug(record: dict) -> None:
+    path = _ddtree_debug_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _tensor_int_list(tensor: torch.Tensor, limit: int | None = None) -> list[int]:
+    flat = tensor.detach().reshape(-1)
+    if limit is not None:
+        flat = flat[:limit]
+    return [int(value) for value in flat.cpu().tolist()]
+
+
+def _topk_debug_rows(logits: torch.Tensor, rows: int, topk: int) -> list[dict]:
+    if logits.numel() == 0 or rows <= 0 or topk <= 0:
+        return []
+    rows = min(rows, logits.shape[0])
+    topk = min(topk, logits.shape[-1])
+    values, indices = torch.topk(logits[:rows].float(), k=topk, dim=-1)
+    values_cpu = values.detach().cpu().tolist()
+    indices_cpu = indices.detach().cpu().tolist()
+    return [
+        {
+            "row": row_idx,
+            "ids": [int(token_id) for token_id in indices_cpu[row_idx]],
+            "logits": [float(value) for value in values_cpu[row_idx]],
+        }
+        for row_idx in range(rows)
+    ]
+
+
+def _tensor_stats(tensor: torch.Tensor | None) -> dict | None:
+    if tensor is None:
+        return None
+    data = tensor.detach().float()
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "mean": float(data.mean().item()) if data.numel() else 0.0,
+        "std": float(data.std(unbiased=False).item()) if data.numel() else 0.0,
+        "norm": float(data.norm().item()) if data.numel() else 0.0,
+        "absmax": float(data.abs().max().item()) if data.numel() else 0.0,
+    }
+
+
+def _cache_debug_summary(cache: DynamicCache | None, max_layers: int = 8) -> dict | None:
+    if cache is None:
+        return None
+
+    layers = []
+    key_cache = getattr(cache, "key_cache", None)
+    value_cache = getattr(cache, "value_cache", None)
+    if key_cache is not None and value_cache is not None:
+        for layer_idx, key in enumerate(key_cache[:max_layers]):
+            value = value_cache[layer_idx]
+            if key is None or value is None or key.numel() == 0:
+                layers.append({"layer": layer_idx, "empty": True})
+                continue
+            layers.append({
+                "layer": layer_idx,
+                "key_shape": list(key.shape),
+                "value_shape": list(value.shape),
+                "seq_len": int(key.shape[-2]),
+                "key_dtype": str(key.dtype),
+            })
+        return {
+            "seq_length": int(cache.get_seq_length()) if hasattr(cache, "get_seq_length") else None,
+            "num_layers": len(key_cache),
+            "layers": layers,
+        }
+
+    cache_layers = getattr(cache, "layers", None)
+    if cache_layers is not None:
+        for layer_idx, layer in enumerate(cache_layers[:max_layers]):
+            key = getattr(layer, "keys", None)
+            value = getattr(layer, "values", None)
+            if key is None or value is None or key.numel() == 0:
+                layers.append({"layer": layer_idx, "empty": True})
+                continue
+            layers.append({
+                "layer": layer_idx,
+                "key_shape": list(key.shape),
+                "value_shape": list(value.shape),
+                "seq_len": int(key.shape[-2]),
+                "key_dtype": str(key.dtype),
+            })
+        return {
+            "seq_length": int(cache.get_seq_length()) if hasattr(cache, "get_seq_length") else None,
+            "num_layers": len(cache_layers),
+            "layers": layers,
+        }
+
+    return {"unsupported": type(cache).__name__}
+
+
+def _mask_visible_summary(mask: torch.Tensor, current_length: int, past_length: int) -> dict:
+    kv_length = past_length + current_length
+    mask_block = mask[0, 0, :current_length, :kv_length]
+    visible = mask_block == 0
+    tree_visible = visible[:, past_length:kv_length]
+    prefix_visible = visible[:, :past_length]
+    return {
+        "shape": list(mask.shape),
+        "dtype": str(mask.dtype),
+        "kv_length": int(kv_length),
+        "full_visible_counts": _tensor_int_list(visible.sum(dim=-1)),
+        "prefix_visible_counts": _tensor_int_list(prefix_visible.sum(dim=-1)),
+        "tree_visible_counts": _tensor_int_list(tree_visible.sum(dim=-1)),
+        "tree_visible_indices": [
+            _tensor_int_list(torch.nonzero(tree_visible[row_idx], as_tuple=False).flatten())
+            for row_idx in range(current_length)
+        ],
+    }
+
+
+def _attention_mask_debug_summary(
+    attention_mask: torch.Tensor,
+    target_attention_mask: torch.Tensor | dict[str, torch.Tensor],
+    verify_position_ids: torch.Tensor,
+    past_length: int,
+    current_length: int,
+) -> dict:
+    kv_length = past_length + current_length
+    key_positions = torch.arange(kv_length, dtype=verify_position_ids.dtype, device=verify_position_ids.device)
+    key_positions[past_length:kv_length] = verify_position_ids[0, :current_length]
+
+    summary = {
+        "base": _mask_visible_summary(attention_mask, current_length, past_length),
+        "query_positions": _tensor_int_list(verify_position_ids[0, :current_length]),
+        "key_positions_prefix_tail": _tensor_int_list(key_positions[max(0, past_length - 8) : past_length]),
+        "key_positions_tree": _tensor_int_list(key_positions[past_length:kv_length]),
+    }
+    if isinstance(target_attention_mask, dict):
+        summary["target_keys"] = sorted(target_attention_mask.keys())
+        for key, value in target_attention_mask.items():
+            summary[key] = _mask_visible_summary(value, current_length, past_length)
+    else:
+        summary["target_keys"] = ["tensor"]
+        summary["target"] = _mask_visible_summary(target_attention_mask, current_length, past_length)
+    return summary
 
 
 @lru_cache(maxsize=1)
@@ -525,7 +700,23 @@ def ddtree_generate(
             )
             debug_mismatch_suppressed = True
 
+    ddtree_debug_enabled = _env_flag("DDTREE_DEBUG_HEAVY")
+    ddtree_debug_include_unlabeled = _env_flag("DDTREE_DEBUG_INCLUDE_UNLABELED")
+    ddtree_debug_max_rounds = _env_int("DDTREE_DEBUG_MAX_ROUNDS", 128)
+    ddtree_debug_topk = _env_int("DDTREE_DEBUG_TOPK", 8)
+    ddtree_debug_depths = _env_int("DDTREE_DEBUG_DEPTHS", draft_horizon)
+    ddtree_debug_cache_layers = _env_int("DDTREE_DEBUG_CACHE_LAYERS", 8)
+
+    def should_emit_ddtree_debug(round_idx: int) -> bool:
+        if not ddtree_debug_enabled:
+            return False
+        if not debug_label and not ddtree_debug_include_unlabeled:
+            return False
+        return ddtree_debug_max_rounds < 0 or round_idx < ddtree_debug_max_rounds
+
     while start < max_length:
+        round_idx = len(acceptance_lengths)
+        emit_round_debug = should_emit_ddtree_debug(round_idx)
         block_output_ids = output_ids[:, start : start + block_size].clone()
         root_token = block_output_ids[:, :1]
 
@@ -557,6 +748,8 @@ def ddtree_generate(
             stage_times[stage_name] += stage_elapsed
 
         tree_compile_start = cuda_time()
+        last_tree_start = previous_tree_start
+        last_tree_length = previous_tree_length
         verify_input_ids, verify_position_ids, verify_attention_mask, previous_tree_start, previous_tree_length = compile_ddtree_tree(
             root_token_id=root_token[0, 0],
             start=start,
@@ -586,6 +779,22 @@ def ddtree_generate(
             past_length=previous_tree_start,
             current_length=previous_tree_length,
         )
+        cache_before_verify_debug = (
+            _cache_debug_summary(verify_cache, ddtree_debug_cache_layers)
+            if emit_round_debug
+            else None
+        )
+        attention_mask_debug = (
+            _attention_mask_debug_summary(
+                verify_attention_mask,
+                target_attention_mask,
+                verify_position_ids,
+                previous_tree_start,
+                previous_tree_length,
+            )
+            if emit_round_debug
+            else None
+        )
         output = target(
             verify_input_ids,
             position_ids=verify_position_ids,
@@ -595,6 +804,11 @@ def ddtree_generate(
             output_hidden_states=True,
         )
         stage_times["verify"] += cuda_time() - verify_stage_start
+        cache_after_verify_debug = (
+            _cache_debug_summary(verify_cache, ddtree_debug_cache_layers)
+            if emit_round_debug
+            else None
+        )
 
         commit_stage_start = cuda_time()
         posterior = sample(output.logits, temperature)
@@ -618,6 +832,80 @@ def ddtree_generate(
             expected_current_length=previous_tree_length,
         )
         past_key_values_target = verify_cache
+        cache_after_compact_debug = (
+            _cache_debug_summary(verify_cache, ddtree_debug_cache_layers)
+            if emit_round_debug
+            else None
+        )
+
+        if emit_round_debug:
+            expected_window = None
+            if debug_expected_output_ids is not None:
+                expected_ids = debug_expected_output_ids.to(device=output.logits.device)
+                expected_end = min(expected_ids.shape[1], start + previous_tree_length + 1)
+                expected_window = _tensor_int_list(expected_ids[0, start:expected_end])
+
+            _write_ddtree_debug({
+                "event": "ddtree_round",
+                "label": debug_label,
+                "rank": int(os.environ.get("RANK", "0")),
+                "round": round_idx,
+                "num_input_tokens": int(num_input_tokens),
+                "start": int(start),
+                "generated_start": int(start - num_input_tokens),
+                "block_size": int(block_size),
+                "draft_horizon": int(draft_horizon),
+                "tree_budget": int(tree_budget),
+                "temperature": float(temperature),
+                "logit_scale": float(model.logit_scale),
+                "final_logit_softcapping": (
+                    None
+                    if model.final_logit_softcapping is None
+                    else float(model.final_logit_softcapping)
+                ),
+                "target_layer_ids": [int(layer_id) for layer_id in model.target_layer_ids],
+                "target_layer_types": list(getattr(get_model_text_config(target), "layer_types", []) or []),
+                "target_sliding_window": getattr(get_model_text_config(target), "sliding_window", None),
+                "target_attn_implementation": getattr(get_model_text_config(target), "_attn_implementation", None),
+                "draft_attn_implementation": getattr(model.config, "_attn_implementation", None),
+                "last_tree_start": int(last_tree_start),
+                "last_tree_length": int(last_tree_length),
+                "current_tree_start": int(previous_tree_start),
+                "current_tree_length": int(previous_tree_length),
+                "root_token": int(root_token[0, 0].item()),
+                "block_input_ids": _tensor_int_list(block_output_ids[0, :block_size]),
+                "verify_input_ids": _tensor_int_list(verify_input_ids[0, :previous_tree_length]),
+                "verify_position_ids": _tensor_int_list(verify_position_ids[0, :previous_tree_length]),
+                "node_token_ids": [int(token_id) for token_id in node_token_ids.tolist()],
+                "node_depths": [int(depth) for depth in node_depths.tolist()],
+                "parents": [int(parent) for parent in parents],
+                "child_maps": [
+                    {str(int(token)): int(child) for token, child in child_map.items()}
+                    for child_map in child_maps
+                ],
+                "draft_topk": _topk_debug_rows(
+                    draft_logits[0],
+                    rows=min(ddtree_debug_depths, draft_logits.shape[1]),
+                    topk=ddtree_debug_topk,
+                ),
+                "mask": attention_mask_debug,
+                "cache_before_verify": cache_before_verify_debug,
+                "cache_after_verify": cache_after_verify_debug,
+                "cache_after_compact": cache_after_compact_debug,
+                "posterior": _tensor_int_list(posterior[0, :previous_tree_length]),
+                "target_topk": _topk_debug_rows(
+                    output.logits[0, :previous_tree_length],
+                    rows=previous_tree_length,
+                    topk=ddtree_debug_topk,
+                ),
+                "accepted_indices": [int(index) for index in accepted_indices],
+                "accepted_tokens": _tensor_int_list(accepted_tokens[0]),
+                "accepted_length": int(len(accepted_indices)),
+                "next_token": int(next_token),
+                "expected_window": expected_window,
+                "verify_target_hidden": _tensor_stats(verify_target_hidden),
+                "accepted_target_hidden": _tensor_stats(target_hidden),
+            })
 
         if debug_expected_output_ids is not None:
             expected_ids = debug_expected_output_ids.to(device=output.logits.device)
