@@ -116,6 +116,20 @@ def get_final_logit_softcapping(config, target_config=None) -> Optional[float]:
         return None
     return float(value)
 
+def get_logit_scale(config) -> float:
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    value = dflash_config.get("logit_scale", getattr(config, "logit_scale", 1.0))
+    return float(value)
+
+def apply_logit_processing(
+    logits: torch.Tensor,
+    logit_scale: float = 1.0,
+    final_logit_softcapping: Optional[float] = None,
+) -> torch.Tensor:
+    if logit_scale != 1.0:
+        logits = logits * logit_scale
+    return apply_final_logit_softcapping(logits, final_logit_softcapping)
+
 def apply_final_logit_softcapping(
     logits: torch.Tensor,
     final_logit_softcapping: Optional[float],

@@ -18,12 +18,13 @@ from transformers import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 from .utils import (
-    apply_final_logit_softcapping,
+    apply_logit_processing,
     build_target_layer_ids,
     compute_target_lm_logits,
     embed_target_input_ids,
     extract_context_feature,
     get_final_logit_softcapping,
+    get_logit_scale,
     get_model_text_config,
     sample,
 )
@@ -181,6 +182,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", getattr(config, "mask_token_id", None))
+        self.logit_scale = get_logit_scale(config)
         self.final_logit_softcapping = get_final_logit_softcapping(config)
         self.post_init()
 
@@ -275,7 +277,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 is_causal=False,
             )[:, -block_size+1:, :])
-            draft_logits = apply_final_logit_softcapping(draft_logits, self.final_logit_softcapping)
+            draft_logits = apply_logit_processing(draft_logits, self.logit_scale, self.final_logit_softcapping)
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
 

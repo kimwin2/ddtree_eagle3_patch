@@ -6,7 +6,7 @@ from transformers import AutoModelForCausalLM, DynamicCache
 
 from model import (
     DFlashDraftModel,
-    apply_final_logit_softcapping,
+    apply_logit_processing,
     compute_target_lm_logits,
     embed_target_input_ids,
     sample,
@@ -92,7 +92,7 @@ def dflash_generate(
                 use_cache=True,
                 is_causal=False,
             )[:, -block_size + 1 :, :])
-            draft_logits = apply_final_logit_softcapping(draft_logits, model.final_logit_softcapping)
+            draft_logits = apply_logit_processing(draft_logits, model.logit_scale, model.final_logit_softcapping)
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
             draft_stage_elapsed = cuda_time() - draft_stage_start
