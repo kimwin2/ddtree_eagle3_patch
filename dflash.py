@@ -1,3 +1,4 @@
+import os
 import time
 from types import SimpleNamespace
 
@@ -15,6 +16,42 @@ from model import (
 
 
 DFLASH_STAGE_ORDER = ("draft", "verify", "commit")
+
+_DFLASH_DEBUG_STATE = {"count": 0}
+
+
+def dflash_debug_dump_target_hidden(tag, target_hidden, target_layer_ids=None):
+    """Dump the raw target context feature for cross-framework comparison.
+
+    Enabled by setting the DFLASH_DEBUG_DUMP env var to an output directory.
+    Dumps at most DFLASH_DEBUG_LIMIT (default 4) tensors so that a single
+    request can be inspected and compared against the vLLM reference.
+    """
+    dump_dir = os.environ.get("DFLASH_DEBUG_DUMP")
+    if not dump_dir:
+        return
+    idx = _DFLASH_DEBUG_STATE["count"]
+    if idx >= int(os.environ.get("DFLASH_DEBUG_LIMIT", "4")):
+        return
+    _DFLASH_DEBUG_STATE["count"] = idx + 1
+    tensor = target_hidden.detach()
+    tensor_f = tensor.float()
+    summary = {
+        "framework": "hf",
+        "tag": tag,
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "target_layer_ids": list(target_layer_ids) if target_layer_ids is not None else None,
+        "mean": tensor_f.mean().item(),
+        "std": tensor_f.std().item(),
+        "abs_mean": tensor_f.abs().mean().item(),
+        "per_token_norm_head": tensor_f.norm(dim=-1).flatten()[:8].tolist(),
+    }
+    print(f"[DFLASH-DEBUG] {summary}", flush=True)
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(dump_dir, f"hf_target_hidden_{idx:03d}_{tag}.pt")
+    torch.save({"summary": summary, "target_hidden": tensor.cpu()}, path)
+    print(f"[DFLASH-DEBUG] saved {path}", flush=True)
 
 
 def format_top_logits(logits: torch.Tensor, k: int = 5) -> str:
@@ -69,6 +106,7 @@ def dflash_generate(
     output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+        dflash_debug_dump_target_hidden("prefill", target_hidden, model.target_layer_ids)
 
     time_to_first_token = cuda_time() - prefill_start
 
@@ -179,6 +217,7 @@ def dflash_generate(
         past_key_values_target.crop(start)
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, : acceptance_length + 1, :]
+            dflash_debug_dump_target_hidden(f"round{len(acceptance_lengths)}", target_hidden, model.target_layer_ids)
         stage_times["commit"] += cuda_time() - commit_stage_start
         round_timestamps.append(cuda_time() - round_clock_start)
 
