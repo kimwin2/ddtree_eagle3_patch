@@ -257,6 +257,30 @@ def prepare_ddtree_attention_mask_for_target(
     }
 
 
+def should_rebuild_ddtree_target_cache(target: AutoModelForCausalLM) -> bool:
+    target_config = get_model_text_config(target)
+    model_type = str(getattr(target_config, "model_type", ""))
+    layer_types = getattr(target_config, "layer_types", None)
+    return model_type.startswith("gemma4") or bool(layer_types and "sliding_attention" in layer_types)
+
+
+def rebuild_ddtree_target_cache(
+    target: AutoModelForCausalLM,
+    output_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    end: int,
+) -> DynamicCache:
+    rebuilt_cache = DynamicCache()
+    target(
+        output_ids[:, :end],
+        position_ids=position_ids[:, :end],
+        past_key_values=rebuilt_cache,
+        use_cache=True,
+        logits_to_keep=1,
+    )
+    return rebuilt_cache
+
+
 def follow_verified_tree(child_maps: list[dict[int, int]], posterior: torch.Tensor) -> tuple[list[int], int]:
     posterior_tokens = posterior[0].tolist()
     accepted_indices = [0]
@@ -427,6 +451,7 @@ def ddtree_generate(
     draft_prefill = True
     previous_tree_start = 0
     previous_tree_length = 0
+    rebuild_target_cache_each_round = should_rebuild_ddtree_target_cache(target)
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -477,6 +502,15 @@ def ddtree_generate(
             previous_tree_length=previous_tree_length,
         )
         stage_times["tree_compile"] += cuda_time() - tree_compile_start
+
+        if rebuild_target_cache_each_round:
+            # Gemma4 sliding-window layers can leave replayed KV state different from causal prefill.
+            past_key_values_target = rebuild_ddtree_target_cache(
+                target=target,
+                output_ids=output_ids,
+                position_ids=position_ids,
+                end=start,
+            )
 
         verify_stage_start = cuda_time()
         verify_cache = copy.deepcopy(past_key_values_target)
