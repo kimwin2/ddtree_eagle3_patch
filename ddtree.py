@@ -722,16 +722,19 @@ def ddtree_generate(
 
         draft_stage_start = cuda_time()
         noise_embedding = embed_target_input_ids(target, block_output_ids)
+        draft_cache_seq_before = past_key_values_draft.get_seq_length()
+        draft_position_ids = position_ids[:, draft_cache_seq_before : start + block_size]
         draft_logits = compute_target_lm_logits(target, model(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
-            position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],
+            position_ids=draft_position_ids,
             past_key_values=past_key_values_draft,
             use_cache=True,
             is_causal=False,
         )[:, -draft_horizon:, :])
         draft_logits = apply_logit_processing(draft_logits, model.logit_scale, model.final_logit_softcapping)
         past_key_values_draft.crop(start)
+        draft_cache_seq_after_crop = past_key_values_draft.get_seq_length()
         draft_stage_elapsed = cuda_time() - draft_stage_start
         if draft_prefill:
             draft_prefill = False
@@ -872,7 +875,11 @@ def ddtree_generate(
                 "last_tree_length": int(last_tree_length),
                 "current_tree_start": int(previous_tree_start),
                 "current_tree_length": int(previous_tree_length),
+                "draft_cache_seq_before": int(draft_cache_seq_before),
+                "draft_cache_seq_after_crop": int(draft_cache_seq_after_crop),
+                "draft_position_ids": _tensor_int_list(draft_position_ids[0]),
                 "root_token": int(root_token[0, 0].item()),
+                "input_ids_tail": _tensor_int_list(output_ids[0, max(0, start - 32) : start + 1]),
                 "block_input_ids": _tensor_int_list(block_output_ids[0, :block_size]),
                 "verify_input_ids": _tensor_int_list(verify_input_ids[0, :previous_tree_length]),
                 "verify_position_ids": _tensor_int_list(verify_position_ids[0, :previous_tree_length]),
