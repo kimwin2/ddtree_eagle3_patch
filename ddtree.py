@@ -503,6 +503,7 @@ def ddtree_generate(
         )
         stage_times["tree_compile"] += cuda_time() - tree_compile_start
 
+        verify_stage_start = cuda_time()
         if rebuild_target_cache_each_round:
             # Gemma4 sliding-window layers can leave replayed KV state different from causal prefill.
             past_key_values_target = rebuild_ddtree_target_cache(
@@ -512,7 +513,6 @@ def ddtree_generate(
                 end=start,
             )
 
-        verify_stage_start = cuda_time()
         verify_cache = copy.deepcopy(past_key_values_target)
         target_attention_mask = prepare_ddtree_attention_mask_for_target(
             target=target,
