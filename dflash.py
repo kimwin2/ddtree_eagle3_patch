@@ -17,6 +17,14 @@ from model import (
 DFLASH_STAGE_ORDER = ("draft", "verify", "commit")
 
 
+def format_top_logits(logits: torch.Tensor, k: int = 5) -> str:
+    top_values, top_indices = torch.topk(logits.float(), k=min(k, logits.shape[-1]), dim=-1)
+    return ",".join(
+        f"{int(token_id.item())}:{float(value.item()):.6f}"
+        for token_id, value in zip(top_indices, top_values)
+    )
+
+
 @torch.inference_mode()
 def dflash_generate(
     model: DFlashDraftModel,
@@ -27,6 +35,8 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    debug_expected_output_ids: torch.Tensor | None = None,
+    debug_label: str = "",
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -104,6 +114,30 @@ def dflash_generate(
 
         commit_stage_start = cuda_time()
         posterior = sample(output.logits, temperature)
+        if debug_expected_output_ids is not None:
+            expected_ids = debug_expected_output_ids.to(device=posterior.device)
+            max_logit_idx = min(block_size - 1, output.logits.shape[1], expected_ids.shape[1] - start - 1)
+            for logit_idx in range(max_logit_idx):
+                predicts_abs = start + logit_idx + 1
+                expected = expected_ids[0, predicts_abs]
+                actual = posterior[0, logit_idx]
+                if bool((actual != expected).item()):
+                    draft_next = block_output_ids[0, logit_idx + 1] if logit_idx + 1 < block_output_ids.shape[1] else None
+                    draft_match = draft_next is not None and bool(draft_next == expected)
+                    print(
+                        f"[DFLASH-VERIFY-MISMATCH] {debug_label} "
+                        f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
+                        f"logit_idx={logit_idx} predicts_abs={predicts_abs} "
+                        f"predicts_gen={predicts_abs - num_input_tokens} "
+                        f"expected={int(expected.item())} posterior={int(actual.item())} "
+                        f"draft_next={int(draft_next.item()) if draft_next is not None else '<missing>'} "
+                        f"draft_next_matches_expected={draft_match} "
+                        f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
+                        f"posterior_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
+                        f"top_logits={format_top_logits(output.logits[0, logit_idx])}",
+                        flush=True,
+                    )
+                    break
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]

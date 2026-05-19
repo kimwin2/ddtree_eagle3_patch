@@ -16,7 +16,7 @@ from model import (
     sample,
     extract_context_feature,
 )
-from dflash import dflash_generate, cuda_time, empty_stage_times
+from dflash import dflash_generate, cuda_time, empty_stage_times, format_top_logits
 
 
 DDTREE_STAGE_ORDER = ("draft", "tree_build", "tree_compile", "verify", "commit")
@@ -316,6 +316,8 @@ def ddtree_generate(
     temperature: float = 0.0,
     tree_budget: int | None = None,
     save_tree_traces: bool = False,
+    debug_expected_output_ids: torch.Tensor | None = None,
+    debug_label: str = "",
 ) -> SimpleNamespace:
     if block_size <= 1:
         return dflash_generate(
@@ -327,6 +329,8 @@ def ddtree_generate(
             block_size=block_size,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
+            debug_expected_output_ids=debug_expected_output_ids,
+            debug_label=debug_label,
         )
 
     num_input_tokens = input_ids.shape[1]
@@ -447,6 +451,34 @@ def ddtree_generate(
         commit_stage_start = cuda_time()
         posterior = sample(output.logits, temperature)
         accepted_indices, next_token = follow_verified_tree(child_maps, posterior)
+        if debug_expected_output_ids is not None:
+            expected_ids = debug_expected_output_ids.to(device=posterior.device)
+            for local_idx, node_index in enumerate(accepted_indices):
+                predicts_abs = start + local_idx + 1
+                if predicts_abs >= expected_ids.shape[1]:
+                    break
+                expected = expected_ids[0, predicts_abs]
+                actual = posterior[0, node_index]
+                if bool((actual != expected).item()):
+                    expected_child = child_maps[node_index].get(int(expected.item()))
+                    posterior_child = child_maps[node_index].get(int(actual.item()))
+                    path_tokens = verify_input_ids[0, accepted_indices].tolist()
+                    print(
+                        f"[DDTREE-VERIFY-MISMATCH] {debug_label} "
+                        f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
+                        f"node_index={node_index} depth={local_idx} "
+                        f"predicts_abs={predicts_abs} predicts_gen={predicts_abs - num_input_tokens} "
+                        f"expected={int(expected.item())} posterior={int(actual.item())} "
+                        f"expected_child={expected_child} posterior_child={posterior_child} "
+                        f"accepted_indices={[int(index) for index in accepted_indices]} "
+                        f"next_token={int(next_token)} "
+                        f"expected_logit={float(output.logits[0, node_index, expected].float().item()):.6f} "
+                        f"posterior_logit={float(output.logits[0, node_index, actual].float().item()):.6f} "
+                        f"top_logits={format_top_logits(output.logits[0, node_index])} "
+                        f"path_tokens={[int(token) for token in path_tokens]}",
+                        flush=True,
+                    )
+                    break
         accepted_index_tensor = torch.tensor(accepted_indices, dtype=torch.long, device=verify_input_ids.device)
         accepted_tokens = verify_input_ids.index_select(1, accepted_index_tensor)
 
