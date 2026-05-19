@@ -37,6 +37,7 @@ def dflash_generate(
     temperature: float = 0.0,
     debug_expected_output_ids: torch.Tensor | None = None,
     debug_label: str = "",
+    debug_mismatch_log_limit: int | None = 8,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -77,6 +78,24 @@ def dflash_generate(
     acceptance_lengths = []
     round_timestamps = []
     draft_prefill = True
+    debug_mismatch_count = 0
+    debug_mismatch_suppressed = False
+
+    def emit_verify_mismatch(message: str) -> None:
+        nonlocal debug_mismatch_count, debug_mismatch_suppressed
+        if debug_mismatch_log_limit is not None and debug_mismatch_log_limit <= 0:
+            return
+        if debug_mismatch_log_limit is None or debug_mismatch_count < debug_mismatch_log_limit:
+            print(message, flush=True)
+            debug_mismatch_count += 1
+            return
+        if not debug_mismatch_suppressed:
+            print(
+                f"[DFLASH-VERIFY-MISMATCH-SUPPRESSED] {debug_label} "
+                f"further mismatch logs suppressed after {debug_mismatch_log_limit} messages",
+                flush=True,
+            )
+            debug_mismatch_suppressed = True
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -125,7 +144,7 @@ def dflash_generate(
                 actual = block_output_ids[0, accepted_offset]
                 if bool((actual != expected).item()):
                     logit_idx = accepted_offset - 1
-                    print(
+                    emit_verify_mismatch(
                         f"[DFLASH-VERIFY-MISMATCH] {debug_label} "
                         f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
                         f"logit_idx={logit_idx} commits_abs={commits_abs} "
@@ -133,8 +152,7 @@ def dflash_generate(
                         f"expected={int(expected.item())} committed={int(actual.item())} "
                         f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
                         f"committed_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
-                        f"top_logits={format_top_logits(output.logits[0, logit_idx])}",
-                        flush=True,
+                        f"top_logits={format_top_logits(output.logits[0, logit_idx])}"
                     )
                     break
             else:
@@ -143,7 +161,7 @@ def dflash_generate(
                     expected = expected_ids[0, predicts_abs]
                     actual = posterior[0, acceptance_length]
                     if bool((actual != expected).item()):
-                        print(
+                        emit_verify_mismatch(
                             f"[DFLASH-VERIFY-MISMATCH] {debug_label} "
                             f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
                             f"logit_idx={acceptance_length} predicts_abs={predicts_abs} "
@@ -151,8 +169,7 @@ def dflash_generate(
                             f"expected={int(expected.item())} posterior={int(actual.item())} "
                             f"expected_logit={float(output.logits[0, acceptance_length, expected].float().item()):.6f} "
                             f"posterior_logit={float(output.logits[0, acceptance_length, actual].float().item()):.6f} "
-                            f"top_logits={format_top_logits(output.logits[0, acceptance_length])}",
-                            flush=True,
+                            f"top_logits={format_top_logits(output.logits[0, acceptance_length])}"
                         )
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]

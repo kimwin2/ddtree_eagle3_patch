@@ -382,6 +382,7 @@ def ddtree_generate(
     save_tree_traces: bool = False,
     debug_expected_output_ids: torch.Tensor | None = None,
     debug_label: str = "",
+    debug_mismatch_log_limit: int | None = 8,
 ) -> SimpleNamespace:
     if block_size <= 1:
         return dflash_generate(
@@ -395,6 +396,7 @@ def ddtree_generate(
             temperature=temperature,
             debug_expected_output_ids=debug_expected_output_ids,
             debug_label=debug_label,
+            debug_mismatch_log_limit=debug_mismatch_log_limit,
         )
 
     num_input_tokens = input_ids.shape[1]
@@ -450,6 +452,24 @@ def ddtree_generate(
     draft_prefill = True
     previous_tree_start = 0
     previous_tree_length = 0
+    debug_mismatch_count = 0
+    debug_mismatch_suppressed = False
+
+    def emit_verify_mismatch(message: str) -> None:
+        nonlocal debug_mismatch_count, debug_mismatch_suppressed
+        if debug_mismatch_log_limit is not None and debug_mismatch_log_limit <= 0:
+            return
+        if debug_mismatch_log_limit is None or debug_mismatch_count < debug_mismatch_log_limit:
+            print(message, flush=True)
+            debug_mismatch_count += 1
+            return
+        if not debug_mismatch_suppressed:
+            print(
+                f"[DDTREE-VERIFY-MISMATCH-SUPPRESSED] {debug_label} "
+                f"further mismatch logs suppressed after {debug_mismatch_log_limit} messages",
+                flush=True,
+            )
+            debug_mismatch_suppressed = True
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -552,7 +572,7 @@ def ddtree_generate(
                     logit_idx = accepted_indices[local_idx - 1]
                     node_index = accepted_indices[local_idx]
                     path_tokens = accepted_tokens[0].tolist()
-                    print(
+                    emit_verify_mismatch(
                         f"[DDTREE-VERIFY-MISMATCH] {debug_label} "
                         f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
                         f"node_index={node_index} depth={local_idx} "
@@ -563,8 +583,7 @@ def ddtree_generate(
                         f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
                         f"committed_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
                         f"top_logits={format_top_logits(output.logits[0, logit_idx])} "
-                        f"path_tokens={[int(token) for token in path_tokens]}",
-                        flush=True,
+                        f"path_tokens={[int(token) for token in path_tokens]}"
                     )
                     break
             else:
@@ -576,7 +595,7 @@ def ddtree_generate(
                         logit_idx = accepted_indices[-1]
                         final_node_index = accepted_indices[-1]
                         path_tokens = accepted_tokens[0].tolist()
-                        print(
+                        emit_verify_mismatch(
                             f"[DDTREE-VERIFY-MISMATCH] {debug_label} "
                             f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
                             f"node_index={final_node_index} depth={len(accepted_indices) - 1} "
@@ -586,8 +605,7 @@ def ddtree_generate(
                             f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
                             f"posterior_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
                             f"top_logits={format_top_logits(output.logits[0, logit_idx])} "
-                            f"path_tokens={[int(token) for token in path_tokens]}",
-                            flush=True,
+                            f"path_tokens={[int(token) for token in path_tokens]}"
                         )
 
         output_ids[:, start : start + len(accepted_indices)] = accepted_tokens
