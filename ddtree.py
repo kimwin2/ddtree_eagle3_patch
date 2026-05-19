@@ -569,6 +569,7 @@ def ddtree_generate(
                 accepted_count = next_offset + 1
 
             replay_output = SimpleNamespace(logits=torch.cat(replay_logits, dim=1))
+            replay_posterior = sample(replay_output.logits, temperature)
             replay_target_hidden = torch.cat(replay_target_hidden_chunks, dim=1)
         else:
             replay_output = target(
