@@ -294,13 +294,52 @@ def follow_verified_tree(child_maps: list[dict[int, int]], posterior: torch.Tens
     return accepted_indices, next_token
 
 
-def _compact_appended_window(cache_tensor: torch.Tensor, past_length: int, keep_current_indices: torch.Tensor) -> None:
+def _compact_appended_window(
+    cache_tensor: torch.Tensor,
+    past_length: int,
+    keep_current_indices: torch.Tensor,
+    expected_current_length: int | None = None,
+) -> None:
     current_length = cache_tensor.shape[-2] - past_length
+    if expected_current_length is not None and current_length != expected_current_length:
+        raise RuntimeError(
+            "DDTree cache compaction expects a full dense target cache whose "
+            "physical KV tail is exactly the verified tree window. Got "
+            f"past_length={past_length}, cache_seq_len={cache_tensor.shape[-2]}, "
+            f"tail_length={current_length}, expected_tail_length={expected_current_length}. "
+            "For Gemma4, create the target cache with DynamicCache() rather than "
+            "DynamicCache(config=...), because HF sliding-window cache layers only "
+            "store a window tail and cannot be compacted by absolute DDTree slots."
+        )
     if current_length <= 0:
         return
 
     keep_count = keep_current_indices.numel()
-    if keep_count == 0 or keep_count == current_length:
+    if keep_count > current_length:
+        raise RuntimeError(
+            f"DDTree accepted {keep_count} cache indices from a verified tail of "
+            f"length {current_length}."
+        )
+    if keep_count > 0:
+        max_keep_index = int(keep_current_indices.max().item())
+        min_keep_index = int(keep_current_indices.min().item())
+        if min_keep_index < 0 or max_keep_index >= current_length:
+            raise RuntimeError(
+                "DDTree accepted cache index outside the verified tail: "
+                f"min={min_keep_index}, max={max_keep_index}, tail_length={current_length}."
+            )
+    if keep_count == 0:
+        return
+    if keep_count == current_length:
+        identity_indices = torch.arange(
+            current_length,
+            dtype=keep_current_indices.dtype,
+            device=keep_current_indices.device,
+        )
+        if bool(torch.equal(keep_current_indices, identity_indices)):
+            return
+        kept_tail = cache_tensor.narrow(-2, past_length, current_length).index_select(-2, keep_current_indices)
+        cache_tensor.narrow(-2, past_length, keep_count).copy_(kept_tail)
         return
 
     if _CPP_COMPACT_ENABLED:
@@ -313,7 +352,12 @@ def _compact_appended_window(cache_tensor: torch.Tensor, past_length: int, keep_
     cache_tensor.narrow(-2, past_length, keep_count).copy_(kept_tail)
 
 
-def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_current_indices: list[int]) -> None:
+def compact_dynamic_cache(
+    past_key_values: DynamicCache,
+    past_length: int,
+    keep_current_indices: list[int],
+    expected_current_length: int | None = None,
+) -> None:
     if len(keep_current_indices) == 0:
         past_key_values.crop(past_length)
         return
@@ -347,7 +391,12 @@ def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_
                 if view_key in seen_cache_views:
                     continue
                 seen_cache_views.add(view_key)
-                _compact_appended_window(cache_tensor, past_length, keep_tensor)
+                _compact_appended_window(
+                    cache_tensor,
+                    past_length,
+                    keep_tensor,
+                    expected_current_length=expected_current_length,
+                )
         past_key_values.crop(past_length + len(keep_current_indices))
         return
 
@@ -361,7 +410,12 @@ def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_
                 if view_key in seen_cache_views:
                     continue
                 seen_cache_views.add(view_key)
-                _compact_appended_window(cache_tensor, past_length, keep_tensor)
+                _compact_appended_window(
+                    cache_tensor,
+                    past_length,
+                    keep_tensor,
+                    expected_current_length=expected_current_length,
+                )
         past_key_values.crop(past_length + len(keep_current_indices))
         return
 
@@ -557,7 +611,12 @@ def ddtree_generate(
         )
         target_hidden = verify_target_hidden.index_select(1, accepted_index_tensor)
 
-        compact_dynamic_cache(verify_cache, start, accepted_indices)
+        compact_dynamic_cache(
+            verify_cache,
+            start,
+            accepted_indices,
+            expected_current_length=previous_tree_length,
+        )
         past_key_values_target = verify_cache
 
         if debug_expected_output_ids is not None:
