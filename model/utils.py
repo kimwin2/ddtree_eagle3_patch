@@ -67,9 +67,10 @@ def get_input_embeddings_module(model):
     raise AttributeError("Could not find input embeddings on the target model.")
 
 def embed_target_input_ids(model, input_ids: torch.Tensor) -> torch.Tensor:
-    embeddings = get_input_embeddings_module(model)(input_ids)
+    embeddings_module = get_input_embeddings_module(model)
+    embeddings = embeddings_module(input_ids)
     scale = get_gemma4_embedding_scale(getattr(model, "config", None))
-    if scale is None:
+    if scale is None or hasattr(embeddings_module, "embed_scale") or hasattr(embeddings_module, "scalar_embed_scale"):
         return embeddings
     return embeddings * scale
 

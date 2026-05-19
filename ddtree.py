@@ -13,6 +13,7 @@ from model import (
     apply_logit_processing,
     compute_target_lm_logits,
     embed_target_input_ids,
+    get_model_text_config,
     sample,
     extract_context_feature,
 )
@@ -214,6 +215,45 @@ def compile_ddtree_tree(
 
     attention_mask = attention_mask_buffer[:, :, :current_length, : past_length + current_length]
     return verify_input_ids, verify_position_ids, attention_mask, past_length, current_length
+
+
+def prepare_ddtree_attention_mask_for_target(
+    target: AutoModelForCausalLM,
+    attention_mask: torch.Tensor,
+    verify_position_ids: torch.Tensor,
+    past_length: int,
+    current_length: int,
+) -> torch.Tensor | dict[str, torch.Tensor]:
+    target_config = get_model_text_config(target)
+    layer_types = getattr(target_config, "layer_types", None)
+    if not layer_types or "sliding_attention" not in layer_types:
+        return attention_mask
+
+    sliding_window = getattr(target_config, "sliding_window", None)
+    if sliding_window is None or sliding_window <= 0:
+        return {
+            "full_attention": attention_mask,
+            "sliding_attention": attention_mask,
+        }
+
+    kv_length = past_length + current_length
+    key_positions = torch.arange(kv_length, dtype=verify_position_ids.dtype, device=verify_position_ids.device)
+    key_positions[past_length:kv_length] = verify_position_ids[0, :current_length]
+    query_positions = verify_position_ids[0, :current_length]
+    sliding_visible = (
+        (key_positions.unsqueeze(0) <= query_positions.unsqueeze(1))
+        & (key_positions.unsqueeze(0) > (query_positions.unsqueeze(1) - int(sliding_window)))
+    )
+
+    sliding_attention_mask = attention_mask.clone()
+    sliding_attention_mask[0, 0, :current_length, :kv_length].masked_fill_(
+        ~sliding_visible,
+        torch.finfo(attention_mask.dtype).min,
+    )
+    return {
+        "full_attention": attention_mask,
+        "sliding_attention": sliding_attention_mask,
+    }
 
 
 def follow_verified_tree(child_maps: list[dict[int, int]], posterior: torch.Tensor) -> tuple[list[int], int]:
@@ -438,10 +478,17 @@ def ddtree_generate(
         stage_times["tree_compile"] += cuda_time() - tree_compile_start
 
         verify_stage_start = cuda_time()
+        target_attention_mask = prepare_ddtree_attention_mask_for_target(
+            target=target,
+            attention_mask=verify_attention_mask,
+            verify_position_ids=verify_position_ids,
+            past_length=previous_tree_start,
+            current_length=previous_tree_length,
+        )
         output = target(
             verify_input_ids,
             position_ids=verify_position_ids,
-            attention_mask=verify_attention_mask,
+            attention_mask=target_attention_mask,
             past_key_values=past_key_values_target,
             use_cache=True,
             output_hidden_states=True,
@@ -454,11 +501,13 @@ def ddtree_generate(
         if debug_expected_output_ids is not None:
             expected_ids = debug_expected_output_ids.to(device=posterior.device)
             for local_idx, node_index in enumerate(accepted_indices):
-                predicts_abs = start + local_idx + 1
-                if predicts_abs >= expected_ids.shape[1]:
+                if local_idx == 0:
+                    continue
+                commits_abs = start + local_idx
+                if commits_abs >= expected_ids.shape[1]:
                     break
-                expected = expected_ids[0, predicts_abs]
-                actual = posterior[0, node_index]
+                expected = expected_ids[0, commits_abs]
+                actual = verify_input_ids[0, node_index]
                 if bool((actual != expected).item()):
                     expected_child = child_maps[node_index].get(int(expected.item()))
                     posterior_child = child_maps[node_index].get(int(actual.item()))
@@ -467,18 +516,39 @@ def ddtree_generate(
                         f"[DDTREE-VERIFY-MISMATCH] {debug_label} "
                         f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
                         f"node_index={node_index} depth={local_idx} "
-                        f"predicts_abs={predicts_abs} predicts_gen={predicts_abs - num_input_tokens} "
-                        f"expected={int(expected.item())} posterior={int(actual.item())} "
+                        f"commits_abs={commits_abs} commits_gen={commits_abs - num_input_tokens} "
+                        f"expected={int(expected.item())} committed={int(actual.item())} "
                         f"expected_child={expected_child} posterior_child={posterior_child} "
                         f"accepted_indices={[int(index) for index in accepted_indices]} "
                         f"next_token={int(next_token)} "
                         f"expected_logit={float(output.logits[0, node_index, expected].float().item()):.6f} "
-                        f"posterior_logit={float(output.logits[0, node_index, actual].float().item()):.6f} "
+                        f"committed_logit={float(output.logits[0, node_index, actual].float().item()):.6f} "
                         f"top_logits={format_top_logits(output.logits[0, node_index])} "
                         f"path_tokens={[int(token) for token in path_tokens]}",
                         flush=True,
                     )
                     break
+            else:
+                predicts_abs = start + len(accepted_indices)
+                if predicts_abs < expected_ids.shape[1]:
+                    expected = expected_ids[0, predicts_abs]
+                    actual = torch.tensor(next_token, dtype=expected.dtype, device=expected.device)
+                    if bool((actual != expected).item()):
+                        final_node_index = accepted_indices[-1]
+                        path_tokens = verify_input_ids[0, accepted_indices].tolist()
+                        print(
+                            f"[DDTREE-VERIFY-MISMATCH] {debug_label} "
+                            f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
+                            f"node_index={final_node_index} depth={len(accepted_indices) - 1} "
+                            f"predicts_abs={predicts_abs} predicts_gen={predicts_abs - num_input_tokens} "
+                            f"expected={int(expected.item())} posterior={int(actual.item())} "
+                            f"accepted_indices={[int(index) for index in accepted_indices]} "
+                            f"expected_logit={float(output.logits[0, final_node_index, expected].float().item()):.6f} "
+                            f"posterior_logit={float(output.logits[0, final_node_index, actual].float().item()):.6f} "
+                            f"top_logits={format_top_logits(output.logits[0, final_node_index])} "
+                            f"path_tokens={[int(token) for token in path_tokens]}",
+                            flush=True,
+                        )
         accepted_index_tensor = torch.tensor(accepted_indices, dtype=torch.long, device=verify_input_ids.device)
         accepted_tokens = verify_input_ids.index_select(1, accepted_index_tensor)
 

@@ -114,31 +114,46 @@ def dflash_generate(
 
         commit_stage_start = cuda_time()
         posterior = sample(output.logits, temperature)
+        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         if debug_expected_output_ids is not None:
             expected_ids = debug_expected_output_ids.to(device=posterior.device)
-            max_logit_idx = min(block_size - 1, output.logits.shape[1], expected_ids.shape[1] - start - 1)
-            for logit_idx in range(max_logit_idx):
-                predicts_abs = start + logit_idx + 1
-                expected = expected_ids[0, predicts_abs]
-                actual = posterior[0, logit_idx]
+            for accepted_offset in range(1, acceptance_length + 1):
+                commits_abs = start + accepted_offset
+                if commits_abs >= expected_ids.shape[1]:
+                    break
+                expected = expected_ids[0, commits_abs]
+                actual = block_output_ids[0, accepted_offset]
                 if bool((actual != expected).item()):
-                    draft_next = block_output_ids[0, logit_idx + 1] if logit_idx + 1 < block_output_ids.shape[1] else None
-                    draft_match = draft_next is not None and bool(draft_next == expected)
+                    logit_idx = accepted_offset - 1
                     print(
                         f"[DFLASH-VERIFY-MISMATCH] {debug_label} "
                         f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
-                        f"logit_idx={logit_idx} predicts_abs={predicts_abs} "
-                        f"predicts_gen={predicts_abs - num_input_tokens} "
-                        f"expected={int(expected.item())} posterior={int(actual.item())} "
-                        f"draft_next={int(draft_next.item()) if draft_next is not None else '<missing>'} "
-                        f"draft_next_matches_expected={draft_match} "
+                        f"logit_idx={logit_idx} commits_abs={commits_abs} "
+                        f"commits_gen={commits_abs - num_input_tokens} "
+                        f"expected={int(expected.item())} committed={int(actual.item())} "
                         f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
-                        f"posterior_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
+                        f"committed_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
                         f"top_logits={format_top_logits(output.logits[0, logit_idx])}",
                         flush=True,
                     )
                     break
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            else:
+                predicts_abs = start + acceptance_length + 1
+                if predicts_abs < expected_ids.shape[1]:
+                    expected = expected_ids[0, predicts_abs]
+                    actual = posterior[0, acceptance_length]
+                    if bool((actual != expected).item()):
+                        print(
+                            f"[DFLASH-VERIFY-MISMATCH] {debug_label} "
+                            f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
+                            f"logit_idx={acceptance_length} predicts_abs={predicts_abs} "
+                            f"predicts_gen={predicts_abs - num_input_tokens} "
+                            f"expected={int(expected.item())} posterior={int(actual.item())} "
+                            f"expected_logit={float(output.logits[0, acceptance_length, expected].float().item()):.6f} "
+                            f"posterior_logit={float(output.logits[0, acceptance_length, actual].float().item()):.6f} "
+                            f"top_logits={format_top_logits(output.logits[0, acceptance_length])}",
+                            flush=True,
+                        )
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
