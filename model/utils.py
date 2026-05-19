@@ -24,6 +24,32 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     ]
     return target_layer_ids
 
+def get_drafter_config(config) -> dict:
+    drafter_config = {}
+    eagle_config = getattr(config, "eagle_config", None)
+    if isinstance(eagle_config, dict):
+        drafter_config.update(eagle_config)
+    dflash_config = getattr(config, "dflash_config", None)
+    if isinstance(dflash_config, dict):
+        drafter_config.update(dflash_config)
+    return drafter_config
+
+def get_dflash_target_layer_ids(
+    config,
+    target_num_layers: int,
+    num_draft_layers: int,
+) -> tuple[list[int], bool]:
+    eagle_aux_layer_ids = getattr(config, "eagle_aux_hidden_state_layer_ids", None)
+    if eagle_aux_layer_ids:
+        return [int(layer_id) - 1 for layer_id in eagle_aux_layer_ids], True
+
+    drafter_config = get_drafter_config(config)
+    for key in ("target_layer_ids", "layer_ids"):
+        if key in drafter_config:
+            return [int(layer_id) for layer_id in drafter_config[key]], True
+
+    return build_target_layer_ids(target_num_layers, num_draft_layers), False
+
 def extract_context_feature(
     hidden_states: list[torch.Tensor],
     layer_ids: Optional[list[int]],

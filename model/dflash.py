@@ -19,10 +19,11 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 from .utils import (
     apply_logit_processing,
-    build_target_layer_ids,
     compute_target_lm_logits,
     embed_target_input_ids,
     extract_context_feature,
+    get_dflash_target_layer_ids,
+    get_drafter_config,
     get_final_logit_softcapping,
     get_logit_scale,
     get_model_text_config,
@@ -197,7 +198,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         set_default_rope_theta(config)
-        dflash_config = getattr(config, "dflash_config", None) or {}
+        drafter_config = get_drafter_config(config)
         self.layers = nn.ModuleList(
             [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -206,10 +207,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "num_target_layers",
             getattr(config, "target_layer_count", config.num_hidden_layers),
         )
-        self._target_layer_ids_explicit = "target_layer_ids" in dflash_config or "layer_ids" in dflash_config
-        self.target_layer_ids = dflash_config.get(
-            "target_layer_ids",
-            dflash_config.get("layer_ids", build_target_layer_ids(target_num_layers, config.num_hidden_layers)),
+        self.target_layer_ids, self._target_layer_ids_explicit = get_dflash_target_layer_ids(
+            config,
+            target_num_layers,
+            config.num_hidden_layers,
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
@@ -217,7 +218,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.fc = nn.Linear(len(self.target_layer_ids) * target_hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
-        self.mask_token_id = dflash_config.get("mask_token_id", getattr(config, "mask_token_id", None))
+        self.mask_token_id = drafter_config.get("mask_token_id", getattr(config, "mask_token_id", None))
         self.logit_scale = get_logit_scale(config)
         self.final_logit_softcapping = get_final_logit_softcapping(config)
         self.post_init()
@@ -227,7 +228,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if not self._target_layer_ids_explicit:
             target_num_layers = getattr(target_config, "num_hidden_layers", None)
             if target_num_layers is not None:
-                self.target_layer_ids = build_target_layer_ids(target_num_layers, self.config.num_hidden_layers)
+                self.target_layer_ids, self._target_layer_ids_explicit = get_dflash_target_layer_ids(
+                    self.config,
+                    target_num_layers,
+                    self.config.num_hidden_layers,
+                )
         self.final_logit_softcapping = get_final_logit_softcapping(
             self.config,
             target_config=target_config,
