@@ -1,4 +1,3 @@
-import copy
 import heapq
 import time
 from functools import lru_cache
@@ -451,7 +450,6 @@ def ddtree_generate(
     draft_prefill = True
     previous_tree_start = 0
     previous_tree_length = 0
-    rebuild_target_cache_each_round = should_rebuild_ddtree_target_cache(target)
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -504,16 +502,9 @@ def ddtree_generate(
         stage_times["tree_compile"] += cuda_time() - tree_compile_start
 
         verify_stage_start = cuda_time()
-        if rebuild_target_cache_each_round:
-            # Gemma4 sliding-window layers can leave replayed KV state different from causal prefill.
-            past_key_values_target = rebuild_ddtree_target_cache(
-                target=target,
-                output_ids=output_ids,
-                position_ids=position_ids,
-                end=start,
-            )
-
-        verify_cache = copy.deepcopy(past_key_values_target)
+        # Verify appends the whole tree to the live cache. Commit then compacts
+        # the appended window down to the accepted root-to-leaf path.
+        verify_cache = past_key_values_target
         target_attention_mask = prepare_ddtree_attention_mask_for_target(
             target=target,
             attention_mask=verify_attention_mask,
@@ -533,79 +524,32 @@ def ddtree_generate(
 
         commit_stage_start = cuda_time()
         posterior = sample(output.logits, temperature)
-        tentative_accepted_indices, tentative_next_token = follow_verified_tree(child_maps, posterior)
-        tentative_index_tensor = torch.tensor(
-            tentative_accepted_indices,
+        accepted_indices, next_token = follow_verified_tree(child_maps, posterior)
+        accepted_index_tensor = torch.tensor(
+            accepted_indices,
             dtype=torch.long,
             device=verify_input_ids.device,
         )
-        tentative_tokens = verify_input_ids.index_select(1, tentative_index_tensor)
+        accepted_tokens = verify_input_ids.index_select(1, accepted_index_tensor)
+        verify_target_hidden = extract_context_feature(
+            output.hidden_states,
+            model.target_layer_ids,
+        )
+        target_hidden = verify_target_hidden.index_select(1, accepted_index_tensor)
 
-        past_key_values_target.crop(start)
-        if rebuild_target_cache_each_round:
-            replay_logits = []
-            replay_target_hidden_chunks = []
-            accepted_count = 1
-            next_token = None
-            for token_offset in range(tentative_tokens.shape[1]):
-                replay_step_output = target(
-                    tentative_tokens[:, token_offset : token_offset + 1],
-                    position_ids=position_ids[:, start + token_offset : start + token_offset + 1],
-                    past_key_values=past_key_values_target,
-                    use_cache=True,
-                    output_hidden_states=True,
-                )
-                replay_logits.append(replay_step_output.logits)
-                replay_target_hidden_chunks.append(
-                    extract_context_feature(replay_step_output.hidden_states, model.target_layer_ids)
-                )
-                step_posterior = sample(replay_step_output.logits, temperature)
-                next_token = int(step_posterior[0, 0].item())
-                next_offset = token_offset + 1
-                if next_offset >= tentative_tokens.shape[1]:
-                    break
-                if bool((tentative_tokens[0, next_offset] != step_posterior[0, 0]).item()):
-                    break
-                accepted_count = next_offset + 1
-
-            replay_output = SimpleNamespace(logits=torch.cat(replay_logits, dim=1))
-            replay_posterior = sample(replay_output.logits, temperature)
-            replay_target_hidden = torch.cat(replay_target_hidden_chunks, dim=1)
-        else:
-            replay_output = target(
-                tentative_tokens,
-                position_ids=position_ids[:, start : start + tentative_tokens.shape[1]],
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            replay_posterior = sample(replay_output.logits, temperature)
-            if tentative_tokens.shape[1] > 1:
-                accepted_count = 1 + (
-                    tentative_tokens[:, 1:] == replay_posterior[:, :-1]
-                ).cumprod(dim=1).sum(dim=1)[0].item()
-            else:
-                accepted_count = 1
-            next_token = int(replay_posterior[0, accepted_count - 1].item())
-            replay_target_hidden = extract_context_feature(
-                replay_output.hidden_states,
-                model.target_layer_ids,
-            )[:, :accepted_count, :]
-
-        accepted_indices = tentative_accepted_indices[:accepted_count]
-        accepted_tokens = tentative_tokens[:, :accepted_count]
-        past_key_values_target.crop(start + accepted_count)
+        compact_dynamic_cache(verify_cache, start, accepted_indices)
+        past_key_values_target = verify_cache
 
         if debug_expected_output_ids is not None:
-            expected_ids = debug_expected_output_ids.to(device=replay_posterior.device)
-            for local_idx in range(1, accepted_count):
+            expected_ids = debug_expected_output_ids.to(device=output.logits.device)
+            for local_idx in range(1, len(accepted_indices)):
                 commits_abs = start + local_idx
                 if commits_abs >= expected_ids.shape[1]:
                     break
                 expected = expected_ids[0, commits_abs]
                 actual = accepted_tokens[0, local_idx]
                 if bool((actual != expected).item()):
-                    logit_idx = local_idx - 1
+                    logit_idx = accepted_indices[local_idx - 1]
                     node_index = accepted_indices[local_idx]
                     path_tokens = accepted_tokens[0].tolist()
                     print(
@@ -616,42 +560,38 @@ def ddtree_generate(
                         f"expected={int(expected.item())} committed={int(actual.item())} "
                         f"accepted_indices={[int(index) for index in accepted_indices]} "
                         f"next_token={int(next_token)} "
-                        f"expected_logit={float(replay_output.logits[0, logit_idx, expected].float().item()):.6f} "
-                        f"committed_logit={float(replay_output.logits[0, logit_idx, actual].float().item()):.6f} "
-                        f"top_logits={format_top_logits(replay_output.logits[0, logit_idx])} "
+                        f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
+                        f"committed_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
+                        f"top_logits={format_top_logits(output.logits[0, logit_idx])} "
                         f"path_tokens={[int(token) for token in path_tokens]}",
                         flush=True,
                     )
                     break
             else:
-                predicts_abs = start + accepted_count
+                predicts_abs = start + len(accepted_indices)
                 if predicts_abs < expected_ids.shape[1]:
                     expected = expected_ids[0, predicts_abs]
                     actual = torch.tensor(next_token, dtype=expected.dtype, device=expected.device)
                     if bool((actual != expected).item()):
-                        logit_idx = accepted_count - 1
+                        logit_idx = accepted_indices[-1]
                         final_node_index = accepted_indices[-1]
                         path_tokens = accepted_tokens[0].tolist()
                         print(
                             f"[DDTREE-VERIFY-MISMATCH] {debug_label} "
                             f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
-                            f"node_index={final_node_index} depth={accepted_count - 1} "
+                            f"node_index={final_node_index} depth={len(accepted_indices) - 1} "
                             f"predicts_abs={predicts_abs} predicts_gen={predicts_abs - num_input_tokens} "
                             f"expected={int(expected.item())} posterior={int(actual.item())} "
                             f"accepted_indices={[int(index) for index in accepted_indices]} "
-                            f"tentative_accepted_indices={[int(index) for index in tentative_accepted_indices]} "
-                            f"tentative_next_token={int(tentative_next_token)} "
-                            f"expected_logit={float(replay_output.logits[0, logit_idx, expected].float().item()):.6f} "
-                            f"posterior_logit={float(replay_output.logits[0, logit_idx, actual].float().item()):.6f} "
-                            f"top_logits={format_top_logits(replay_output.logits[0, logit_idx])} "
+                            f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
+                            f"posterior_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
+                            f"top_logits={format_top_logits(output.logits[0, logit_idx])} "
                             f"path_tokens={[int(token) for token in path_tokens]}",
                             flush=True,
                         )
 
         output_ids[:, start : start + len(accepted_indices)] = accepted_tokens
         output_ids[:, start + len(accepted_indices)] = next_token
-
-        target_hidden = replay_target_hidden
 
         acceptance_lengths.append(len(accepted_indices))
         start += len(accepted_indices)
