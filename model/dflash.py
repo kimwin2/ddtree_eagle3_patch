@@ -37,6 +37,22 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+def build_sliding_causal_mask(
+    q_len: int,
+    kv_len: int,
+    sliding_window: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    query_positions = torch.arange(kv_len - q_len, kv_len, device=device)
+    key_positions = torch.arange(kv_len, device=device)
+    visible = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+    if sliding_window is not None and sliding_window > 0:
+        visible &= key_positions.unsqueeze(0) > (query_positions.unsqueeze(1) - sliding_window)
+    mask = torch.full((q_len, kv_len), torch.finfo(dtype).min, dtype=dtype, device=device)
+    mask.masked_fill_(visible, 0)
+    return mask[None, None, :, :]
+
 class Qwen3DFlashAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -93,6 +109,15 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        if self.sliding_window is not None:
+            sliding_mask = build_sliding_causal_mask(
+                q_len=q_len,
+                kv_len=k.shape[-2],
+                sliding_window=self.sliding_window,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            attention_mask = sliding_mask if attention_mask is None else attention_mask + sliding_mask
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
