@@ -158,6 +158,12 @@ def main() -> None:
         default="auto",
         help="Override the target model attention backend for exactness debugging.",
     )
+    parser.add_argument(
+        "--draft-attn-implementation",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        default="auto",
+        help="Override the DFlash draft model attention backend for exactness debugging.",
+    )
     parser.add_argument("--disable-cpp-compact-cache", action="store_true")
     parser.add_argument("--draft-algorithm", choices=["auto", "dflash", "eagle3"], default="auto")
     parser.add_argument("--eagle3-batch-size", type=int, default=1)
@@ -195,13 +201,22 @@ def main() -> None:
             return False
 
     installed_flash_attn = has_flash_attn()
-    if draft_algorithm == "dflash" and not installed_flash_attn:
-        raise RuntimeError("flash_attn must be installed because the draft DFlash model always uses FlashAttention")
 
     target_attn_implementation = "flash_attention_2" if args.flash_attn else "sdpa"
     if args.target_attn_implementation != "auto":
         target_attn_implementation = args.target_attn_implementation
-    draft_attn_implementation = "flash_attention_2" if draft_algorithm == "dflash" else "pytorch"
+    if draft_algorithm == "dflash":
+        draft_attn_implementation = (
+            "flash_attention_2"
+            if args.draft_attn_implementation == "auto"
+            else args.draft_attn_implementation
+        )
+        if draft_attn_implementation == "flash_attention_2" and not installed_flash_attn:
+            raise RuntimeError(
+                "flash_attn must be installed when DFlash draft attention uses FlashAttention"
+            )
+    else:
+        draft_attn_implementation = "pytorch"
 
     if draft_algorithm == "eagle3" and target_attn_implementation == "flash_attention_2":
         logger.warning("Eagle3 tree verification uses a custom attention mask; forcing the target verifier to torch.sdpa.")
