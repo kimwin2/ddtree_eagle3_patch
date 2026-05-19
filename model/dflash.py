@@ -29,6 +29,16 @@ from .utils import (
     sample,
 )
 
+def set_default_rope_theta(config: Qwen3Config, default_theta: float = 1000000.0) -> None:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is None:
+        rope_parameters = {"rope_type": "default"}
+        config.rope_parameters = rope_parameters
+    if "rope_theta" not in rope_parameters:
+        rope_parameters["rope_theta"] = default_theta
+    config.rope_theta = rope_parameters["rope_theta"]
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -186,6 +196,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
+        set_default_rope_theta(config)
         dflash_config = getattr(config, "dflash_config", None) or {}
         self.layers = nn.ModuleList(
             [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
