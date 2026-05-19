@@ -1,3 +1,4 @@
+import copy
 import heapq
 import time
 from functools import lru_cache
@@ -478,6 +479,7 @@ def ddtree_generate(
         stage_times["tree_compile"] += cuda_time() - tree_compile_start
 
         verify_stage_start = cuda_time()
+        verify_cache = copy.deepcopy(past_key_values_target)
         target_attention_mask = prepare_ddtree_attention_mask_for_target(
             target=target,
             attention_mask=verify_attention_mask,
@@ -489,7 +491,7 @@ def ddtree_generate(
             verify_input_ids,
             position_ids=verify_position_ids,
             attention_mask=target_attention_mask,
-            past_key_values=past_key_values_target,
+            past_key_values=verify_cache,
             use_cache=True,
             output_hidden_states=True,
         )
