@@ -316,6 +316,12 @@ def main() -> None:
                 enable_thinking=False,
             )
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
+            print(
+                f"[DFLASH-DEBUG] hf_input_ids dataset={args.dataset} sample_idx={idx} "
+                f"turn={len(messages) - 1} len={input_ids.shape[1]} "
+                f"ids={input_ids[0].tolist()}",
+                flush=True,
+            )
 
             response = {}
             response["baseline"] = target_generate(
