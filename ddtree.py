@@ -18,7 +18,13 @@ from model import (
     sample,
     extract_context_feature,
 )
-from dflash import dflash_generate, cuda_time, empty_stage_times, format_top_logits
+from dflash import (
+    build_dflash_target_attention_mask,
+    cuda_time,
+    dflash_generate,
+    empty_stage_times,
+    format_top_logits,
+)
 
 
 DDTREE_STAGE_ORDER = ("draft", "tree_build", "tree_compile", "verify", "commit")
@@ -535,6 +541,14 @@ def ddtree_generate(
     stage_times = empty_stage_times(DDTREE_STAGE_ORDER + DDTREE_TREE_BUILD_STAGE_ORDER)
 
     prefill_start = cuda_time()
+    prefill_attention_mask = build_dflash_target_attention_mask(
+        target=target,
+        past_length=0,
+        query_length=num_input_tokens,
+        query_position_ids=position_ids[:, :num_input_tokens],
+        dtype=target.dtype,
+        device=target.device,
+    )
     output = target(
         input_ids,
         position_ids=position_ids[:, :num_input_tokens],
@@ -542,6 +556,7 @@ def ddtree_generate(
         use_cache=True,
         logits_to_keep=1,
         output_hidden_states=True,
+        attention_mask=prefill_attention_mask,
     )
 
     output_ids[:, :num_input_tokens] = input_ids

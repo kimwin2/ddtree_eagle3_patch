@@ -12,12 +12,55 @@ from model import (
     embed_target_input_ids,
     sample,
     extract_context_feature,
+    get_model_text_config,
 )
 
 
 DFLASH_STAGE_ORDER = ("draft", "verify", "commit")
 
 _DFLASH_DEBUG_STATE = {"count": 0}
+
+
+def build_dflash_target_attention_mask(
+    target: AutoModelForCausalLM,
+    past_length: int,
+    query_length: int,
+    query_position_ids: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor | dict[str, torch.Tensor] | None:
+    """Build a sliding-window-aware attention mask for a target chain forward.
+
+    For hybrid-attention models (e.g. Gemma4) the sliding layers must only see
+    the last ``sliding_window`` keys, but the transformers default mask builder
+    is not guaranteed to apply this restriction when the cache is a plain
+    DynamicCache. Building the mask explicitly avoids the silent failure where
+    sequence length exceeds the sliding window and sliding layers degrade into
+    full attention.
+    """
+    target_config = get_model_text_config(target)
+    layer_types = getattr(target_config, "layer_types", None)
+    if not layer_types or "sliding_attention" not in layer_types:
+        return None
+    sliding_window = getattr(target_config, "sliding_window", None)
+    if sliding_window is None or sliding_window <= 0:
+        return None
+
+    kv_length = past_length + query_length
+    key_positions = torch.arange(kv_length, device=device, dtype=query_position_ids.dtype)
+    query_positions = query_position_ids[0]
+
+    causal_visible = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+    sliding_visible = causal_visible & (
+        key_positions.unsqueeze(0) > (query_positions.unsqueeze(1) - int(sliding_window))
+    )
+
+    minval = torch.finfo(dtype).min
+    full_mask = torch.zeros((1, 1, query_length, kv_length), dtype=dtype, device=device)
+    full_mask.masked_fill_(~causal_visible[None, None, :, :], minval)
+    sliding_mask = torch.zeros_like(full_mask)
+    sliding_mask.masked_fill_(~sliding_visible[None, None, :, :], minval)
+    return {"full_attention": full_mask, "sliding_attention": sliding_mask}
 
 
 def dflash_debug_dump_target_hidden(tag, target_hidden, target_layer_ids=None):
@@ -93,6 +136,14 @@ def dflash_generate(
     stage_times = empty_stage_times(DFLASH_STAGE_ORDER)
 
     prefill_start = cuda_time()
+    prefill_attention_mask = build_dflash_target_attention_mask(
+        target=target,
+        past_length=0,
+        query_length=num_input_tokens,
+        query_position_ids=position_ids[:, :num_input_tokens],
+        dtype=target.dtype,
+        device=target.device,
+    )
     output = target(
         input_ids,
         position_ids=position_ids[:, :num_input_tokens],
@@ -100,6 +151,7 @@ def dflash_generate(
         use_cache=True,
         logits_to_keep=1,
         output_hidden_states=True if block_size > 1 else False,
+        attention_mask=prefill_attention_mask,
     )
 
     output_ids[:, :num_input_tokens] = input_ids
@@ -160,12 +212,21 @@ def dflash_generate(
                 stage_times["draft"] += draft_stage_elapsed
 
         verify_stage_start = cuda_time()
+        verify_attention_mask = build_dflash_target_attention_mask(
+            target=target,
+            past_length=start,
+            query_length=block_size,
+            query_position_ids=block_position_ids,
+            dtype=target.dtype,
+            device=target.device,
+        )
         output = target(
             block_output_ids,
             position_ids=block_position_ids,
             past_key_values=past_key_values_target,
             use_cache=True,
             output_hidden_states=True if block_size > 1 else False,
+            attention_mask=verify_attention_mask,
         )
         stage_times["verify"] += cuda_time() - verify_stage_start
 
