@@ -131,6 +131,43 @@ def validate_response_tokens(
             raise RuntimeError(message)
 
 
+def collect_stop_token_ids(tokenizer, target) -> list[int]:
+    """Aggregate EOS token ids from the tokenizer and the target generation config.
+
+    `tokenizer.eos_token_id` is exposed as a single int even when the underlying
+    model config declares multiple EOS ids (e.g. Gemma's [1, 106, 50]). Without
+    pulling the rest from `generation_config.eos_token_id` the loop only stops
+    on one of them and keeps decoding past the real end-of-turn.
+    """
+    candidates: list[int] = []
+
+    def _extend(value) -> None:
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, set)):
+            for entry in value:
+                _extend(entry)
+            return
+        candidates.append(int(value))
+
+    _extend(getattr(tokenizer, "eos_token_id", None))
+    generation_config = getattr(target, "generation_config", None)
+    if generation_config is not None:
+        _extend(getattr(generation_config, "eos_token_id", None))
+    target_config = getattr(target, "config", None)
+    if target_config is not None:
+        _extend(getattr(target_config, "eos_token_id", None))
+
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for token_id in candidates:
+        if token_id in seen:
+            continue
+        seen.add(token_id)
+        deduped.append(token_id)
+    return deduped
+
+
 def detect_draft_algorithm(draft_name_or_path: str) -> str:
     config = AutoConfig.from_pretrained(draft_name_or_path)
     architectures = [architecture.lower() for architecture in getattr(config, "architectures", [])]
@@ -247,6 +284,9 @@ def main() -> None:
         methods_to_run = ["eagle3"]
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    stop_token_ids = collect_stop_token_ids(tokenizer, target)
+    if dist.is_main():
+        logger.info(f"Using stop_token_ids={stop_token_ids}")
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
@@ -265,7 +305,7 @@ def main() -> None:
         target=target,
         input_ids=warmup_input_ids,
         max_new_tokens=warmup_max_new_tokens,
-        stop_token_ids=[tokenizer.eos_token_id],
+        stop_token_ids=stop_token_ids,
         temperature=args.temperature,
     )
     for method_key in methods_to_run:
@@ -275,7 +315,7 @@ def main() -> None:
                 target=target,
                 input_ids=warmup_input_ids,
                 max_new_tokens=warmup_max_new_tokens,
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
             )
         elif method_key == "dflash":
@@ -286,7 +326,7 @@ def main() -> None:
                 mask_token_id=draft_model.mask_token_id,
                 max_new_tokens=warmup_max_new_tokens,
                 block_size=block_size,
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
             )
         else:
@@ -298,7 +338,7 @@ def main() -> None:
                 max_new_tokens=warmup_max_new_tokens,
                 block_size=block_size,
                 tree_budget=method_key_to_tree_budget[method_key],
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
             )
 
@@ -328,7 +368,7 @@ def main() -> None:
                 target=target,
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
             )
             for method_key in methods_to_run:
@@ -338,7 +378,7 @@ def main() -> None:
                         target=target,
                         input_ids=input_ids,
                         max_new_tokens=args.max_new_tokens,
-                        stop_token_ids=[tokenizer.eos_token_id],
+                        stop_token_ids=stop_token_ids,
                         temperature=args.temperature,
                     )
                 elif method_key == "dflash":
@@ -349,7 +389,7 @@ def main() -> None:
                         mask_token_id=draft_model.mask_token_id,
                         max_new_tokens=args.max_new_tokens,
                         block_size=block_size,
-                        stop_token_ids=[tokenizer.eos_token_id],
+                        stop_token_ids=stop_token_ids,
                         temperature=args.temperature,
                         debug_expected_output_ids=response["baseline"].output_ids if args.validate_exact_match else None,
                         debug_label=f"idx={idx} turn={len(messages) - 1} method={method_key}",
@@ -363,7 +403,7 @@ def main() -> None:
                         max_new_tokens=args.max_new_tokens,
                         block_size=block_size,
                         tree_budget=method_key_to_tree_budget[method_key],
-                        stop_token_ids=[tokenizer.eos_token_id],
+                        stop_token_ids=stop_token_ids,
                         temperature=args.temperature,
                         debug_expected_output_ids=response["baseline"].output_ids if args.validate_exact_match else None,
                         debug_label=f"idx={idx} turn={len(messages) - 1} method={method_key}",
