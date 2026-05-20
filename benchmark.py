@@ -16,6 +16,28 @@ from ddtree import ddtree_generate, maybe_enable_cpp_compact
 from eagle3 import eagle3_generate, target_generate
 
 
+def get_stop_token_ids(tokenizer, target) -> list[int]:
+    stop_token_ids = []
+
+    for source in (
+        getattr(target, "generation_config", None),
+        getattr(target, "config", None),
+        getattr(getattr(target, "config", None), "text_config", None),
+    ):
+        eos_token_id = getattr(source, "eos_token_id", None)
+        if eos_token_id is None:
+            continue
+        if isinstance(eos_token_id, int):
+            stop_token_ids.append(eos_token_id)
+        else:
+            stop_token_ids.extend(int(token_id) for token_id in eos_token_id)
+
+    if tokenizer.eos_token_id is not None:
+        stop_token_ids.append(int(tokenizer.eos_token_id))
+
+    return sorted(set(stop_token_ids))
+
+
 def _generated_ids(response) -> torch.Tensor:
     return response.output_ids[0, response.num_input_tokens :]
 
@@ -262,6 +284,8 @@ def main() -> None:
         methods_to_run = ["eagle3"]
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    stop_token_ids = get_stop_token_ids(tokenizer, target)
+    logger.info(f"Using stop_token_ids={stop_token_ids}")
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
@@ -280,7 +304,7 @@ def main() -> None:
         target=target,
         input_ids=warmup_input_ids,
         max_new_tokens=warmup_max_new_tokens,
-        stop_token_ids=[tokenizer.eos_token_id],
+        stop_token_ids=stop_token_ids,
         temperature=args.temperature,
     )
     for method_key in methods_to_run:
@@ -290,7 +314,7 @@ def main() -> None:
                 target=target,
                 input_ids=warmup_input_ids,
                 max_new_tokens=warmup_max_new_tokens,
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
             )
         elif method_key == "dflash":
@@ -301,7 +325,7 @@ def main() -> None:
                 mask_token_id=draft_model.mask_token_id,
                 max_new_tokens=warmup_max_new_tokens,
                 block_size=block_size,
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
             )
         else:
@@ -313,7 +337,7 @@ def main() -> None:
                 max_new_tokens=warmup_max_new_tokens,
                 block_size=block_size,
                 tree_budget=method_key_to_tree_budget[method_key],
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
             )
 
@@ -337,7 +361,7 @@ def main() -> None:
                 target=target,
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
-                stop_token_ids=[tokenizer.eos_token_id],
+                stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
             )
             for method_key in methods_to_run:
@@ -347,7 +371,7 @@ def main() -> None:
                         target=target,
                         input_ids=input_ids,
                         max_new_tokens=args.max_new_tokens,
-                        stop_token_ids=[tokenizer.eos_token_id],
+                        stop_token_ids=stop_token_ids,
                         temperature=args.temperature,
                     )
                 elif method_key == "dflash":
@@ -358,7 +382,7 @@ def main() -> None:
                         mask_token_id=draft_model.mask_token_id,
                         max_new_tokens=args.max_new_tokens,
                         block_size=block_size,
-                        stop_token_ids=[tokenizer.eos_token_id],
+                        stop_token_ids=stop_token_ids,
                         temperature=args.temperature,
                         debug_expected_output_ids=response["baseline"].output_ids if args.validate_exact_match else None,
                         debug_label=f"idx={idx} turn={len(messages) - 1} method={method_key}",
@@ -372,7 +396,7 @@ def main() -> None:
                         max_new_tokens=args.max_new_tokens,
                         block_size=block_size,
                         tree_budget=method_key_to_tree_budget[method_key],
-                        stop_token_ids=[tokenizer.eos_token_id],
+                        stop_token_ids=stop_token_ids,
                         temperature=args.temperature,
                         debug_expected_output_ids=response["baseline"].output_ids if args.validate_exact_match else None,
                         debug_label=f"idx={idx} turn={len(messages) - 1} method={method_key}",
