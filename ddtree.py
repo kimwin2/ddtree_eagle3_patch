@@ -784,6 +784,9 @@ def ddtree_generate(
     previous_tree_length = 0
     debug_mismatch_count = 0
     debug_mismatch_suppressed = False
+    ddtree_compare_debug_enabled = _env_flag("DDTREE_DEBUG_COMPARE")
+    if ddtree_compare_debug_enabled and not _env_flag("DDTREE_DEBUG_COMPARE_MISMATCH"):
+        debug_mismatch_log_limit = 0
 
     def emit_verify_mismatch(message: str) -> None:
         nonlocal debug_mismatch_count, debug_mismatch_suppressed
@@ -801,11 +804,11 @@ def ddtree_generate(
             )
             debug_mismatch_suppressed = True
 
-    ddtree_debug_enabled = _env_flag("DDTREE_DEBUG_COMPARE") or _env_flag("DDTREE_DEBUG_HEAVY")
-    ddtree_debug_include_unlabeled = _env_flag("DDTREE_DEBUG_INCLUDE_UNLABELED")
-    ddtree_debug_max_rounds = _env_int("DDTREE_DEBUG_MAX_ROUNDS", 3)
-    ddtree_debug_topk = _env_int("DDTREE_DEBUG_TOPK", 8)
-    ddtree_debug_depths = _env_int("DDTREE_DEBUG_DEPTHS", draft_horizon)
+    ddtree_debug_enabled = ddtree_compare_debug_enabled
+    ddtree_debug_include_unlabeled = _env_flag("DDTREE_DEBUG_COMPARE_INCLUDE_UNLABELED")
+    ddtree_debug_max_rounds = _env_int("DDTREE_DEBUG_COMPARE_MAX_ROUNDS", 3)
+    ddtree_debug_topk = _env_int("DDTREE_DEBUG_COMPARE_TOPK", 8)
+    ddtree_debug_depths = _env_int("DDTREE_DEBUG_COMPARE_DEPTHS", draft_horizon)
 
     def should_emit_ddtree_debug(round_idx: int) -> bool:
         if not ddtree_debug_enabled:
