@@ -108,8 +108,7 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 def get_final_logit_softcapping(config, target_config=None) -> Optional[float]:
-    dflash_config = getattr(config, "dflash_config", None) or {}
-    value = dflash_config.get("final_logit_softcapping", getattr(config, "final_logit_softcapping", None))
+    value = getattr(config, "final_logit_softcapping", None)
     if value is None and target_config is not None and is_gemma4_config(target_config):
         target_text_config = get_text_config(target_config)
         value = getattr(target_text_config, "final_logit_softcapping", None)
@@ -118,8 +117,7 @@ def get_final_logit_softcapping(config, target_config=None) -> Optional[float]:
     return float(value)
 
 def get_logit_scale(config) -> float:
-    dflash_config = getattr(config, "dflash_config", None) or {}
-    value = dflash_config.get("logit_scale", getattr(config, "logit_scale", 1.0))
+    value = getattr(config, "logit_scale", 1.0)
     return float(value)
 
 def apply_logit_processing(
@@ -127,9 +125,10 @@ def apply_logit_processing(
     logit_scale: float = 1.0,
     final_logit_softcapping: Optional[float] = None,
 ) -> torch.Tensor:
+    logits = apply_final_logit_softcapping(logits, final_logit_softcapping)
     if logit_scale != 1.0:
         logits = logits * logit_scale
-    return apply_final_logit_softcapping(logits, final_logit_softcapping)
+    return logits
 
 def apply_final_logit_softcapping(
     logits: torch.Tensor,
