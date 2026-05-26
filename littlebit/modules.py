@@ -216,20 +216,16 @@ class LittleBitLinear(nn.Module):
             N, dim = X.shape
             device = X.device
             
-            # 정밀도를 위해 잠시 float32 사용
             X_f = X.float()
             
-            # 1. Initialize R with Random Orthogonal (기존 방식과 동일한 출발점)
             R = torch.empty((dim, dim), device=device, dtype=torch.float32)
             torch.nn.init.orthogonal_(R)
             
             # 2. Iterative Optimization (Alternating Minimization)
             for _ in range(n_iter):
-                # Step A: R 고정, Binary Target B 업데이트
                 Z = X_f @ R
                 B = torch.sign(Z)
                 
-                # Step B: B 고정, R 업데이트 (Orthogonal Procrustes Problem)
                 # Maximize Tr(B^T @ X @ R) -> SVD of B^T @ X
                 M = B.t() @ X_f
                 U_p, _, Vt_p = torch.linalg.svd(M, full_matrices=False)

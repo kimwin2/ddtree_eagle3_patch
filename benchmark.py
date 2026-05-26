@@ -46,121 +46,6 @@ def get_stop_token_ids(tokenizer, target) -> list[int]:
     return sorted(set(stop_token_ids))
 
 
-def _generated_ids(response) -> torch.Tensor:
-    return response.output_ids[0, response.num_input_tokens :]
-
-
-def _first_token_mismatch(lhs: torch.Tensor, rhs: torch.Tensor) -> int | None:
-    compare_len = min(lhs.numel(), rhs.numel())
-    if compare_len > 0:
-        mismatch = (lhs[:compare_len] != rhs[:compare_len]).nonzero(as_tuple=True)[0]
-        if mismatch.numel() > 0:
-            return int(mismatch[0].item())
-    if lhs.numel() != rhs.numel():
-        return compare_len
-    return None
-
-
-def _format_token(tokenizer, token_ids: torch.Tensor, offset: int) -> str:
-    if offset >= token_ids.numel():
-        return "<missing>"
-    token_id = int(token_ids[offset].item())
-    piece = tokenizer.decode([token_id], skip_special_tokens=False)
-    return f"{token_id}:{piece!r}"
-
-
-def _format_token_window(tokenizer, token_ids: torch.Tensor, center: int, radius: int = 4) -> str:
-    start = max(center - radius, 0)
-    end = min(center + radius + 1, token_ids.numel())
-    return " ".join(f"{offset}={_format_token(tokenizer, token_ids, offset)}" for offset in range(start, end))
-
-
-def _alignment_hint(lhs: torch.Tensor, rhs: torch.Tensor, offset: int, max_shift: int = 16, window: int = 32) -> str:
-    for shift in range(1, max_shift + 1):
-        lhs_end = min(lhs.numel(), offset + shift + window)
-        rhs_end = min(rhs.numel(), offset + window)
-        compare_len = min(lhs_end - offset - shift, rhs_end - offset)
-        if compare_len > 0 and torch.equal(lhs[offset + shift : offset + shift + compare_len], rhs[offset : offset + compare_len]):
-            return f" alignment=method_matches_baseline_after_deleting_{shift}_baseline_tokens"
-
-        lhs_end = min(lhs.numel(), offset + window)
-        rhs_end = min(rhs.numel(), offset + shift + window)
-        compare_len = min(lhs_end - offset, rhs_end - offset - shift)
-        if compare_len > 0 and torch.equal(lhs[offset : offset + compare_len], rhs[offset + shift : offset + shift + compare_len]):
-            return f" alignment=baseline_matches_method_after_deleting_{shift}_method_tokens"
-    return ""
-
-
-def _acceptance_hint(method_response, mismatch_offset: int) -> str:
-    acceptance_lengths = getattr(method_response, "acceptance_lengths", None)
-    if not acceptance_lengths:
-        return ""
-
-    offset = 0
-    for round_idx, round_length in enumerate(acceptance_lengths):
-        next_offset = offset + int(round_length)
-        if mismatch_offset < next_offset:
-            nearby = acceptance_lengths[max(round_idx - 3, 0) : round_idx + 4]
-            return (
-                f" accept_round={round_idx} round_start={offset} "
-                f"round_len={int(round_length)} local={mismatch_offset - offset} "
-                f"nearby_acceptance={nearby}"
-            )
-        offset = next_offset
-    return f" accept_after_recorded_rounds total_accepted={offset}"
-
-
-def validate_response_tokens(
-    tokenizer,
-    idx: int,
-    turn_idx: int,
-    response: dict,
-    fail_on_mismatch: bool,
-    mask_token_id: int | None = None,
-) -> None:
-    baseline_ids = _generated_ids(response["baseline"])
-    for method_key, method_response in response.items():
-        if method_key == "baseline":
-            continue
-        method_ids = _generated_ids(method_response)
-        mismatch_offset = _first_token_mismatch(baseline_ids, method_ids)
-        if mismatch_offset is None:
-            print(
-                f"[TOKEN-MATCH] idx={idx} turn={turn_idx} method={method_key} "
-                f"generated_tokens={method_ids.numel()}",
-                flush=True,
-            )
-            continue
-
-        hint = ""
-        if mismatch_offset < baseline_ids.numel() and int(baseline_ids[mismatch_offset].item()) == mask_token_id:
-            hint = " hint=baseline_token_is_mask_token_id_check_output_trimming"
-        hint += _alignment_hint(baseline_ids, method_ids, mismatch_offset)
-        hint += _acceptance_hint(method_response, mismatch_offset)
-
-        message = (
-            f"[TOKEN-MISMATCH] idx={idx} turn={turn_idx} method={method_key} "
-            f"baseline_len={baseline_ids.numel()} method_len={method_ids.numel()} "
-            f"first_diff={mismatch_offset} "
-            f"baseline={_format_token(tokenizer, baseline_ids, mismatch_offset)} "
-            f"method={_format_token(tokenizer, method_ids, mismatch_offset)}"
-            f"{hint}"
-        )
-        print(message, flush=True)
-        print(
-            f"[TOKEN-WINDOW] idx={idx} turn={turn_idx} method={method_key} "
-            f"baseline_window={_format_token_window(tokenizer, baseline_ids, mismatch_offset)}",
-            flush=True,
-        )
-        print(
-            f"[TOKEN-WINDOW] idx={idx} turn={turn_idx} method={method_key} "
-            f"method_window={_format_token_window(tokenizer, method_ids, mismatch_offset)}",
-            flush=True,
-        )
-        if fail_on_mismatch:
-            raise RuntimeError(message)
-
-
 def detect_draft_algorithm(draft_name_or_path: str) -> str:
     config = AutoConfig.from_pretrained(draft_name_or_path)
     architectures = [architecture.lower() for architecture in getattr(config, "architectures", [])]
@@ -185,13 +70,13 @@ def main() -> None:
         "--target-attn-implementation",
         choices=["auto", "sdpa", "eager", "flash_attention_2"],
         default="auto",
-        help="Override the target model attention backend for exactness debugging.",
+        help="Override the target model attention backend.",
     )
     parser.add_argument(
         "--draft-attn-implementation",
         choices=["auto", "eager", "sdpa", "flash_attention_2"],
         default="auto",
-        help="Override the DFlash draft model attention backend for exactness debugging.",
+        help="Override the DFlash draft model attention backend.",
     )
     parser.add_argument("--disable-cpp-compact-cache", action="store_true")
     parser.add_argument("--draft-algorithm", choices=["auto", "dflash", "eagle3"], default="auto")
@@ -200,8 +85,6 @@ def main() -> None:
     parser.add_argument("--eagle3-topk", type=int, default=8)
     parser.add_argument("--eagle3-tree-size", type=int, default=32)
     parser.add_argument("--save-path", type=str, default=None)
-    parser.add_argument("--validate-exact-match", action="store_true")
-    parser.add_argument("--fail-on-mismatch", action="store_true")
     parser.add_argument("--apply-ee", action="store_true")
 
     parser.add_argument("--draft-type", type=str, default="dflash", choices=["dflash", "littlebit_dflash"])
@@ -215,8 +98,6 @@ def main() -> None:
     parser.add_argument("--residual", action="store_true")
     
     args = parser.parse_args()
-    if args.fail_on_mismatch:
-        args.validate_exact_match = True
 
     random.seed(0)
     np.random.seed(0)
@@ -265,7 +146,7 @@ def main() -> None:
     elif target_attn_implementation == "sdpa" and installed_flash_attn:
         logger.warning("DDTree uses a custom tree attention mask on the target model. For compatibility, forcing the target verifier to torch.sdpa.")
     elif target_attn_implementation == "eager":
-        logger.warning("Loading the target with eager attention for exactness debugging.")
+        logger.warning("Loading the target with eager attention.")
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
@@ -277,13 +158,6 @@ def main() -> None:
     block_size = args.block_size
     if draft_algorithm == "dflash":
         draft_attn_implementation="flex_attention"
-        # draft_model = DFlashDraftModel.from_pretrained(
-        #     args.draft_name_or_path,
-        #     attn_implementation="flex_attention",
-        #     dtype=torch.bfloat16,
-        # ).to(device).eval()
-        # if hasattr(draft_model, "configure_for_target"):
-        #     draft_model.configure_for_target(target)
         if args.draft_type == "littlebit_dflash":
             draft_model = load_quantized_dflash_model(
                 args.draft_name_or_path,
@@ -299,8 +173,6 @@ def main() -> None:
                 dtype=torch.bfloat16,
             ).to(device).eval()
 
-        # draft_model = torch.compile(draft_model, mode="reduce-overhead", dynamic=True)
-        print("Draft model load done!")
         block_size = args.block_size if args.block_size is not None else draft_model.block_size
         tree_budgets = [int(tree_budget) for tree_budget in args.tree_budget.split(",")]
         methods_to_run = ["dflash"]
@@ -326,7 +198,6 @@ def main() -> None:
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
-        # dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
         dataset = dataset.select(range(args.max_samples))
 
     warmup_input_text = tokenizer.apply_chat_template(
@@ -424,8 +295,6 @@ def main() -> None:
                         block_size=block_size,
                         stop_token_ids=stop_token_ids,
                         temperature=args.temperature,
-                        debug_expected_output_ids=response["baseline"].output_ids if args.validate_exact_match else None,
-                        debug_label=f"idx={idx} turn={len(messages) - 1} method={method_key}",
                         apply_ee=args.apply_ee
                     )
                 else:
@@ -439,20 +308,8 @@ def main() -> None:
                         tree_budget=method_key_to_tree_budget[method_key],
                         stop_token_ids=stop_token_ids,
                         temperature=args.temperature,
-                        debug_expected_output_ids=response["baseline"].output_ids if args.validate_exact_match else None,
-                        debug_label=f"idx={idx} turn={len(messages) - 1} method={method_key}",
                         apply_ee=args.apply_ee
                     )
-
-            if args.validate_exact_match:
-                validate_response_tokens(
-                    tokenizer=tokenizer,
-                    idx=idx,
-                    turn_idx=len(messages) - 1,
-                    response=response,
-                    fail_on_mismatch=args.fail_on_mismatch,
-                    mask_token_id=getattr(draft_model, "mask_token_id", None),
-                )
 
             spec_response = response[methods_to_run[-1]]
             generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens :]

@@ -468,7 +468,6 @@ def plot_bar_speeds(results: list[dict], output: Path) -> None:
             dflash_vals.append(agg.get((dataset, model), {"dflash": 0.0})["dflash"])
         color = MODEL_COLORS_DFLASH.get(model, "#AAAAAA")
         display_name = MODEL_DISPLAY_NAMES.get(model, model)
-        # DFlash slot i → left half
         df_offset = (i - (n_models - 1) / 2 - (n_models + gap_units) / 2 + 0.5) * bar_width
         ax.bar(
             x + df_offset, dflash_vals, bar_width,
@@ -484,7 +483,6 @@ def plot_bar_speeds(results: list[dict], output: Path) -> None:
             all_ddtree[(i, j)] = val
         color = MODEL_COLORS_DDTREE.get(model, "#555555")
         display_name = MODEL_DISPLAY_NAMES.get(model, model)
-        # DDTree slot i → right half (shifted by n_models + gap)
         ddt_offset = (i - (n_models - 1) / 2 + (n_models + gap_units) / 2 + 0.5) * bar_width
         ax.bar(
             x + ddt_offset, ddtree_vals, bar_width,
@@ -494,7 +492,6 @@ def plot_bar_speeds(results: list[dict], output: Path) -> None:
 
     # Handles from loop: [4B-DF, 8B-DF, 30B-DF, 4B-DDT, 8B-DDT, 30B-DDT]
     # ncol=3 fills column-first, so interleave to get Row1=all-DF, Row2=all-DDT:
-    # → [4B-DF, 4B-DDT, 8B-DF, 8B-DDT, 30B-DF, 30B-DDT]
     handles, labels = ax.get_legend_handles_labels()
     interleaved_h, interleaved_l = [], []
     for i in range(n_models):

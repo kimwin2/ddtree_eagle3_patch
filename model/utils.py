@@ -205,7 +205,6 @@ def extract_context_feature(
     selected_states = []
     
     if early_exit:
-        # prefill: 4, 5번째를 3번째로 덮어씌움
         fix_id = layer_ids[2]
         for i, layer_id in enumerate(layer_ids):
             if i > 2:
@@ -213,7 +212,6 @@ def extract_context_feature(
             else:
                 selected_states.append(hidden_states[layer_id + offset])
     else:
-        # decoding: 기존처럼 각 layer의 실제 hidden 사용
         for layer_id in layer_ids:
             selected_states.append(hidden_states[layer_id + offset])
     

@@ -2,45 +2,33 @@
 
 set -u
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 MASTER_PORT="${MASTER_PORT:-29600}"
 LOG_DIR="${LOG_DIR:-logs}"
 RUN_DIR="${RUN_DIR:-runs}"
-EAGLE3_BATCH_SIZE="${EAGLE3_BATCH_SIZE:-1}"
-EAGLE3_DEPTH="${EAGLE3_DEPTH:-7}"
-EAGLE3_TOPK="${EAGLE3_TOPK:-8}"
-EAGLE3_TREE_SIZE="${EAGLE3_TREE_SIZE:-32}"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 
 TASKS=(
-  "gsm8k:128"
-  "math500:128"
-  "aime24:30"
-  "aime25:30"
-  "humaneval:164"
-  "mbpp:128"
-  "livecodebench:128"
-  "swe-bench:128"
-  "mt-bench:80"
-  "alpaca:128"
+  "gsm8k:1"
 )
 
 MODEL_DRAFT_PAIRS=(
-  "Qwen/Qwen3-4B|z-lab/Qwen3-4B-DFlash-b16"
-  "Qwen/Qwen3-8B|z-lab/Qwen3-8B-DFlash-b16"
-  "Qwen/Qwen3-Coder-30B-A3B-Instruct|z-lab/Qwen3-Coder-30B-A3B-DFlash"
+  "/group-volume/models/gemma-4-E2B-it|/group-volume/bs93.lee/LittleD/checkpoints/gemma4-e2b-dflash-bf16-8gpu-v7-swa-h/epoch_6_step_268890"
 )
 
 TEMPERATURES=(
   "0.0"
-  "1.0"
 )
 
 COMMON_BENCHMARK_ARGS=(
   --max-new-tokens 2048
+)
+
+DRAFT_CONFIGS=(
+  "dflash|||||||"
 )
 
 slugify() {
@@ -51,10 +39,24 @@ slugify() {
   echo "$value"
 }
 
-is_eagle3_draft() {
-  local draft_name="$1"
-  local lower="${draft_name,,}"
-  [[ "${lower}" == *"eagle3"* ]]
+build_draft_args() {
+  local config="$1"
+  IFS='|' read -r draft_type quant_mod quant_func eff_bit kv_factor min_split_dim group_size residual <<< "${config}"
+
+  local args=()
+  args+=(--draft-type "${draft_type}")
+
+  if [[ "${draft_type}" == "littlebit_dflash" ]]; then
+    [[ -n "${quant_mod}" ]] && args+=(--quant-mod "${quant_mod}")
+    [[ -n "${quant_func}" ]] && args+=(--quant-func "${quant_func}")
+    [[ -n "${eff_bit}" ]] && args+=(--eff-bit "${eff_bit}")
+    [[ -n "${kv_factor}" ]] && args+=(--kv-factor "${kv_factor}")
+    [[ -n "${min_split_dim}" ]] && args+=(--min-split-dim "${min_split_dim}")
+    [[ -n "${group_size}" ]] && args+=(--group-size "${group_size}")
+    [[ "${residual}" == "true" ]] && args+=(--residual)
+  fi
+
+  echo "${args[*]}"
 }
 
 run_benchmark() {
@@ -102,23 +104,10 @@ for task in "${TASKS[@]}"; do
       temperature_slug="$(slugify "${temperature}")"
       run_name="${dataset_name}__${model_slug}__${draft_slug}__temp${temperature_slug}"
 
-      if is_eagle3_draft "${draft_name}"; then
-        eagle3_mode="eagle3_b${EAGLE3_BATCH_SIZE}_d${EAGLE3_DEPTH}_k${EAGLE3_TOPK}_t${EAGLE3_TREE_SIZE}"
-        run_benchmark \
-          "${dataset_name}" \
-          "${max_samples}" \
-          "${model_name}" \
-          "${draft_name}" \
-          "${eagle3_mode}" \
-          "${RUN_DIR}/${run_name}__${eagle3_mode}.pt" \
-          "${LOG_DIR}/${run_name}__${eagle3_mode}.log" \
-          --temperature "${temperature}" \
-          --draft-algorithm eagle3 \
-          --eagle3-batch-size "${EAGLE3_BATCH_SIZE}" \
-          --eagle3-depth "${EAGLE3_DEPTH}" \
-          --eagle3-topk "${EAGLE3_TOPK}" \
-          --eagle3-tree-size "${EAGLE3_TREE_SIZE}"
-      else
+      for draft_config in "${DRAFT_CONFIGS[@]}"; do
+        draft_args_str="$(build_draft_args "${draft_config}")"
+        read -ra draft_args <<< "${draft_args_str}"
+
         run_benchmark \
           "${dataset_name}" \
           "${max_samples}" \
@@ -127,19 +116,10 @@ for task in "${TASKS[@]}"; do
           "sdpa" \
           "${RUN_DIR}/${run_name}__sdpa.pt" \
           "${LOG_DIR}/${run_name}__sdpa.log" \
-          --temperature "${temperature}"
-
-        run_benchmark \
-          "${dataset_name}" \
-          "${max_samples}" \
-          "${model_name}" \
-          "${draft_name}" \
-          "flash_attn" \
-          "${RUN_DIR}/${run_name}__flash_attn.pt" \
-          "${LOG_DIR}/${run_name}__flash_attn.log" \
           --temperature "${temperature}" \
-          --flash-attn
-      fi
+          "${draft_args[@]}"
+
+      done
     done
   done
 done

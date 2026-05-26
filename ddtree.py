@@ -1,9 +1,6 @@
 import heapq
-import json
-import os
 import time
 from functools import lru_cache
-from pathlib import Path
 from types import SimpleNamespace
 
 from loguru import logger
@@ -20,7 +17,7 @@ from model import (
     sample,
     extract_context_feature,
 )
-from dflash import dflash_generate, cuda_time, empty_stage_times, format_top_logits
+from dflash import dflash_generate, cuda_time, empty_stage_times
 
 
 DDTREE_STAGE_ORDER = ("draft", "tree_build", "tree_compile", "verify", "commit")
@@ -28,279 +25,6 @@ DDTREE_TREE_BUILD_STAGE_ORDER = ("tree_build_copy", "tree_build_heap", "tree_bui
 
 
 _CPP_COMPACT_ENABLED = False
-
-
-def _env_flag(name: str) -> bool:
-    value = os.environ.get(name, "")
-    return value.lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        logger.warning(f"Ignoring invalid integer value for {name}={value!r}")
-        return default
-
-
-def _ddtree_debug_path() -> Path:
-    rank = os.environ.get("RANK", "0")
-    local_rank = os.environ.get("LOCAL_RANK", rank)
-    template = os.environ.get("DDTREE_DEBUG_JSONL", "ddtree_debug_rank{rank}.jsonl")
-    path_text = template.format(rank=rank, local_rank=local_rank, pid=os.getpid())
-    path = Path(path_text)
-    if "{rank}" not in template and "{local_rank}" not in template and "{pid}" not in template:
-        world_size = _env_int("WORLD_SIZE", 1)
-        if world_size > 1:
-            path = path.with_name(f"{path.stem}.rank{rank}{path.suffix or '.jsonl'}")
-    return path
-
-
-def _write_ddtree_debug(record: dict) -> None:
-    path = _ddtree_debug_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
-
-
-def _tensor_int_list(tensor: torch.Tensor, limit: int | None = None) -> list[int]:
-    flat = tensor.detach().reshape(-1)
-    if limit is not None:
-        flat = flat[:limit]
-    return [int(value) for value in flat.cpu().tolist()]
-
-
-def _topk_debug_rows(logits: torch.Tensor, rows: int, topk: int) -> list[dict]:
-    if logits.numel() == 0 or rows <= 0 or topk <= 0:
-        return []
-    rows = min(rows, logits.shape[0])
-    topk = min(topk, logits.shape[-1])
-    values, indices = torch.topk(logits[:rows].float(), k=topk, dim=-1)
-    values_cpu = values.detach().cpu().tolist()
-    indices_cpu = indices.detach().cpu().tolist()
-    return [
-        {
-            "row": row_idx,
-            "ids": [int(token_id) for token_id in indices_cpu[row_idx]],
-            "logits": [float(value) for value in values_cpu[row_idx]],
-        }
-        for row_idx in range(rows)
-    ]
-
-
-def _tensor_stats(tensor: torch.Tensor | None) -> dict | None:
-    if tensor is None:
-        return None
-    data = tensor.detach().float()
-    return {
-        "shape": list(tensor.shape),
-        "dtype": str(tensor.dtype),
-        "mean": float(data.mean().item()) if data.numel() else 0.0,
-        "std": float(data.std(unbiased=False).item()) if data.numel() else 0.0,
-        "norm": float(data.norm().item()) if data.numel() else 0.0,
-        "absmax": float(data.abs().max().item()) if data.numel() else 0.0,
-    }
-
-
-def _tensor_probe(tensor: torch.Tensor | None, limit: int = 8) -> dict | None:
-    stats = _tensor_stats(tensor)
-    if stats is None:
-        return None
-    data = tensor.detach().float().reshape(-1)
-    if data.numel():
-        stats.update({
-            "sum": float(data.sum().item()),
-            "head": [float(value) for value in data[:limit].cpu().tolist()],
-            "tail": [float(value) for value in data[-limit:].cpu().tolist()],
-        })
-    else:
-        stats.update({"sum": 0.0, "head": [], "tail": []})
-    return stats
-
-
-def _cache_seq_length(cache: DynamicCache | None) -> int | None:
-    if cache is None or not hasattr(cache, "get_seq_length"):
-        return None
-    return int(cache.get_seq_length())
-
-
-def _selected_topk_debug_rows(
-    logits: torch.Tensor,
-    rows: list[int] | tuple[int, ...],
-    topk: int,
-) -> list[dict]:
-    if logits.numel() == 0 or topk <= 0:
-        return []
-    row_ids = sorted({int(row) for row in rows if 0 <= int(row) < logits.shape[0]})
-    if not row_ids:
-        return []
-    row_tensor = torch.tensor(row_ids, dtype=torch.long, device=logits.device)
-    values, indices = torch.topk(
-        logits.index_select(0, row_tensor).float(),
-        k=min(topk, logits.shape[-1]),
-        dim=-1,
-    )
-    values_cpu = values.detach().cpu().tolist()
-    indices_cpu = indices.detach().cpu().tolist()
-    return [
-        {
-            "row": row_id,
-            "ids": [int(token_id) for token_id in indices_cpu[offset]],
-            "logits": [float(value) for value in values_cpu[offset]],
-        }
-        for offset, row_id in enumerate(row_ids)
-    ]
-
-
-def _mask_counts_summary(mask: torch.Tensor, current_length: int, past_length: int) -> dict:
-    kv_length = past_length + current_length
-    visible = mask[0, 0, :current_length, :kv_length] == 0
-    tree_visible = visible[:, past_length:kv_length]
-    prefix_visible = visible[:, :past_length]
-    return {
-        "shape": list(mask.shape),
-        "dtype": str(mask.dtype),
-        "kv_length": int(kv_length),
-        "full_visible_counts": _tensor_int_list(visible.sum(dim=-1)),
-        "prefix_visible_counts": _tensor_int_list(prefix_visible.sum(dim=-1)),
-        "tree_visible_counts": _tensor_int_list(tree_visible.sum(dim=-1)),
-    }
-
-
-def _compact_attention_debug(
-    attention_mask: torch.Tensor,
-    target_attention_mask: torch.Tensor | dict[str, torch.Tensor],
-    verify_position_ids: torch.Tensor,
-    past_length: int,
-    current_length: int,
-) -> dict:
-    kv_length = past_length + current_length
-    key_positions = torch.arange(
-        kv_length,
-        dtype=verify_position_ids.dtype,
-        device=verify_position_ids.device,
-    )
-    key_positions[past_length:kv_length] = verify_position_ids[0, :current_length]
-    summary = {
-        "base": _mask_counts_summary(attention_mask, current_length, past_length),
-        "query_positions": _tensor_int_list(verify_position_ids[0, :current_length]),
-        "key_positions_tree": _tensor_int_list(key_positions[past_length:kv_length]),
-        "key_positions_prefix_tail": _tensor_int_list(
-            key_positions[max(0, past_length - 8) : past_length]
-        ),
-    }
-    if isinstance(target_attention_mask, dict):
-        summary["target_keys"] = sorted(target_attention_mask.keys())
-        for key, value in target_attention_mask.items():
-            summary[key] = _mask_counts_summary(value, current_length, past_length)
-    else:
-        summary["target_keys"] = ["tensor"]
-        summary["target"] = _mask_counts_summary(
-            target_attention_mask,
-            current_length,
-            past_length,
-        )
-    return summary
-
-
-def _cache_debug_summary(cache: DynamicCache | None, max_layers: int = 8) -> dict | None:
-    if cache is None:
-        return None
-
-    layers = []
-    key_cache = getattr(cache, "key_cache", None)
-    value_cache = getattr(cache, "value_cache", None)
-    if key_cache is not None and value_cache is not None:
-        for layer_idx, key in enumerate(key_cache[:max_layers]):
-            value = value_cache[layer_idx]
-            if key is None or value is None or key.numel() == 0:
-                layers.append({"layer": layer_idx, "empty": True})
-                continue
-            layers.append({
-                "layer": layer_idx,
-                "key_shape": list(key.shape),
-                "value_shape": list(value.shape),
-                "seq_len": int(key.shape[-2]),
-                "key_dtype": str(key.dtype),
-            })
-        return {
-            "seq_length": int(cache.get_seq_length()) if hasattr(cache, "get_seq_length") else None,
-            "num_layers": len(key_cache),
-            "layers": layers,
-        }
-
-    cache_layers = getattr(cache, "layers", None)
-    if cache_layers is not None:
-        for layer_idx, layer in enumerate(cache_layers[:max_layers]):
-            key = getattr(layer, "keys", None)
-            value = getattr(layer, "values", None)
-            if key is None or value is None or key.numel() == 0:
-                layers.append({"layer": layer_idx, "empty": True})
-                continue
-            layers.append({
-                "layer": layer_idx,
-                "key_shape": list(key.shape),
-                "value_shape": list(value.shape),
-                "seq_len": int(key.shape[-2]),
-                "key_dtype": str(key.dtype),
-            })
-        return {
-            "seq_length": int(cache.get_seq_length()) if hasattr(cache, "get_seq_length") else None,
-            "num_layers": len(cache_layers),
-            "layers": layers,
-        }
-
-    return {"unsupported": type(cache).__name__}
-
-
-def _mask_visible_summary(mask: torch.Tensor, current_length: int, past_length: int) -> dict:
-    kv_length = past_length + current_length
-    mask_block = mask[0, 0, :current_length, :kv_length]
-    visible = mask_block == 0
-    tree_visible = visible[:, past_length:kv_length]
-    prefix_visible = visible[:, :past_length]
-    return {
-        "shape": list(mask.shape),
-        "dtype": str(mask.dtype),
-        "kv_length": int(kv_length),
-        "full_visible_counts": _tensor_int_list(visible.sum(dim=-1)),
-        "prefix_visible_counts": _tensor_int_list(prefix_visible.sum(dim=-1)),
-        "tree_visible_counts": _tensor_int_list(tree_visible.sum(dim=-1)),
-        "tree_visible_indices": [
-            _tensor_int_list(torch.nonzero(tree_visible[row_idx], as_tuple=False).flatten())
-            for row_idx in range(current_length)
-        ],
-    }
-
-
-def _attention_mask_debug_summary(
-    attention_mask: torch.Tensor,
-    target_attention_mask: torch.Tensor | dict[str, torch.Tensor],
-    verify_position_ids: torch.Tensor,
-    past_length: int,
-    current_length: int,
-) -> dict:
-    kv_length = past_length + current_length
-    key_positions = torch.arange(kv_length, dtype=verify_position_ids.dtype, device=verify_position_ids.device)
-    key_positions[past_length:kv_length] = verify_position_ids[0, :current_length]
-
-    summary = {
-        "base": _mask_visible_summary(attention_mask, current_length, past_length),
-        "query_positions": _tensor_int_list(verify_position_ids[0, :current_length]),
-        "key_positions_prefix_tail": _tensor_int_list(key_positions[max(0, past_length - 8) : past_length]),
-        "key_positions_tree": _tensor_int_list(key_positions[past_length:kv_length]),
-    }
-    if isinstance(target_attention_mask, dict):
-        summary["target_keys"] = sorted(target_attention_mask.keys())
-        for key, value in target_attention_mask.items():
-            summary[key] = _mask_visible_summary(value, current_length, past_length)
-    else:
-        summary["target_keys"] = ["tensor"]
-        summary["target"] = _mask_visible_summary(target_attention_mask, current_length, past_length)
-    return summary
 
 
 @lru_cache(maxsize=1)
@@ -469,8 +193,6 @@ def compile_ddtree_tree(
     current_length = 1 + int(node_token_ids.numel())
 
     attention_mask_buffer.zero_()
-    # if previous_tree_length > 0:
-    #     attention_mask_buffer[0, 0, :previous_tree_length, previous_tree_start : previous_tree_start + previous_tree_length] = 0
 
     verify_input_ids = verify_input_ids_buffer[:, :current_length]
     verify_input_ids[0, 0] = root_token_id
@@ -711,10 +433,7 @@ def ddtree_generate(
     temperature: float = 0.0,
     tree_budget: int | None = None,
     save_tree_traces: bool = False,
-    debug_expected_output_ids: torch.Tensor | None = None,
-    debug_label: str = "",
-    debug_mismatch_log_limit: int | None = 8,
-    apply_ee = False,
+    apply_ee: bool = False,
 ) -> SimpleNamespace:
     if block_size <= 1:
         return dflash_generate(
@@ -726,9 +445,7 @@ def ddtree_generate(
             block_size=block_size,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
-            debug_expected_output_ids=debug_expected_output_ids,
-            debug_label=debug_label,
-            debug_mismatch_log_limit=debug_mismatch_log_limit,
+            apply_ee=apply_ee,
         )
 
     num_input_tokens = input_ids.shape[1]
@@ -784,44 +501,8 @@ def ddtree_generate(
     draft_prefill = True
     previous_tree_start = 0
     previous_tree_length = 0
-    debug_mismatch_count = 0
-    debug_mismatch_suppressed = False
-    ddtree_compare_debug_enabled = _env_flag("DDTREE_DEBUG_COMPARE")
-    if ddtree_compare_debug_enabled and not _env_flag("DDTREE_DEBUG_COMPARE_MISMATCH"):
-        debug_mismatch_log_limit = 0
-
-    def emit_verify_mismatch(message: str) -> None:
-        nonlocal debug_mismatch_count, debug_mismatch_suppressed
-        if debug_mismatch_log_limit is not None and debug_mismatch_log_limit <= 0:
-            return
-        if debug_mismatch_log_limit is None or debug_mismatch_count < debug_mismatch_log_limit:
-            print(message, flush=True)
-            debug_mismatch_count += 1
-            return
-        if not debug_mismatch_suppressed:
-            print(
-                f"[DDTREE-VERIFY-MISMATCH-SUPPRESSED] {debug_label} "
-                f"further mismatch logs suppressed after {debug_mismatch_log_limit} messages",
-                flush=True,
-            )
-            debug_mismatch_suppressed = True
-
-    ddtree_debug_enabled = ddtree_compare_debug_enabled
-    ddtree_debug_include_unlabeled = _env_flag("DDTREE_DEBUG_COMPARE_INCLUDE_UNLABELED")
-    ddtree_debug_max_rounds = _env_int("DDTREE_DEBUG_COMPARE_MAX_ROUNDS", 3)
-    ddtree_debug_topk = _env_int("DDTREE_DEBUG_COMPARE_TOPK", 8)
-    ddtree_debug_depths = _env_int("DDTREE_DEBUG_COMPARE_DEPTHS", draft_horizon)
-
-    def should_emit_ddtree_debug(round_idx: int) -> bool:
-        if not ddtree_debug_enabled:
-            return False
-        if not debug_label and not ddtree_debug_include_unlabeled:
-            return False
-        return ddtree_debug_max_rounds < 0 or round_idx < ddtree_debug_max_rounds
 
     while start < max_length:
-        round_idx = len(acceptance_lengths)
-        emit_round_debug = should_emit_ddtree_debug(round_idx)
         block_output_ids = output_ids[:, start : start + block_size].clone()
         root_token = block_output_ids[:, :1]
 
@@ -829,7 +510,6 @@ def ddtree_generate(
         noise_embedding = embed_target_input_ids(target, block_output_ids)
         draft_cache_seq_before = past_key_values_draft.get_seq_length()
         draft_position_ids = position_ids[:, draft_cache_seq_before : start + block_size]
-        draft_context_hidden = target_hidden
         draft_hidden = model(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
@@ -842,7 +522,6 @@ def ddtree_generate(
         draft_logits = compute_target_lm_logits(target, draft_sample_hidden)
         draft_logits = apply_logit_processing(draft_logits, model.logit_scale, model.final_logit_softcapping)
         past_key_values_draft.crop(start)
-        draft_cache_seq_after_crop = past_key_values_draft.get_seq_length()
         draft_stage_elapsed = cuda_time() - draft_stage_start
         if draft_prefill:
             draft_prefill = False
@@ -859,8 +538,6 @@ def ddtree_generate(
             stage_times[stage_name] += stage_elapsed
 
         tree_compile_start = cuda_time()
-        last_tree_start = previous_tree_start
-        last_tree_length = previous_tree_length
         verify_input_ids, verify_position_ids, verify_attention_mask, previous_tree_start, previous_tree_length = compile_ddtree_tree(
             root_token_id=root_token[0, 0],
             start=start,
@@ -883,7 +560,6 @@ def ddtree_generate(
         # Verify appends the whole tree to the live cache. Commit then compacts
         # the appended window down to the accepted root-to-leaf path.
         verify_cache = past_key_values_target
-        target_cache_seq_before_verify = _cache_seq_length(verify_cache)
         target_attention_mask = prepare_ddtree_attention_mask_for_target(
             target=target,
             attention_mask=verify_attention_mask,
@@ -900,7 +576,6 @@ def ddtree_generate(
             output_hidden_states=True,
         )
         stage_times["verify"] += cuda_time() - verify_stage_start
-        target_cache_seq_after_verify = _cache_seq_length(verify_cache)
 
         commit_stage_start = cuda_time()
         posterior = sample(output.logits, temperature)
@@ -924,156 +599,6 @@ def ddtree_generate(
             expected_current_length=previous_tree_length,
         )
         past_key_values_target = verify_cache
-        target_cache_seq_after_compact = _cache_seq_length(verify_cache)
-
-        if emit_round_debug:
-            expected_window = None
-            if debug_expected_output_ids is not None:
-                expected_ids = debug_expected_output_ids.to(device=output.logits.device)
-                expected_end = min(expected_ids.shape[1], start + previous_tree_length + 1)
-                expected_window = _tensor_int_list(expected_ids[0, start:expected_end])
-
-            target_probe_rows = sorted({
-                0,
-                max(0, previous_tree_length - 1),
-                *[int(index) for index in accepted_indices],
-                *[max(0, int(index) - 1) for index in accepted_indices],
-            })
-            target_config = get_model_text_config(target)
-            target_dtype = str(next(target.parameters()).dtype)
-            draft_dtype = str(next(model.parameters()).dtype)
-            _write_ddtree_debug({
-                "event": "ddtree_compare_round",
-                "schema": 1,
-                "label": debug_label,
-                "rank": int(os.environ.get("RANK", "0")),
-                "round": round_idx,
-                "num_input_tokens": int(num_input_tokens),
-                "start": int(start),
-                "generated_start": int(start - num_input_tokens),
-                "block_size": int(block_size),
-                "draft_horizon": int(draft_horizon),
-                "tree_budget": int(tree_budget),
-                "temperature": float(temperature),
-                "logit_scale": float(model.logit_scale),
-                "final_logit_softcapping": (
-                    None
-                    if model.final_logit_softcapping is None
-                    else float(model.final_logit_softcapping)
-                ),
-                "target_layer_ids": [int(layer_id) for layer_id in model.target_layer_ids],
-                "target_layer_types": list(getattr(target_config, "layer_types", []) or []),
-                "target_sliding_window": getattr(target_config, "sliding_window", None),
-                "target_attn_implementation": getattr(target_config, "_attn_implementation", None),
-                "draft_attn_implementation": getattr(model.config, "_attn_implementation", None),
-                "target_param_dtype": target_dtype,
-                "draft_param_dtype": draft_dtype,
-                "target_hidden_dtype": str(draft_context_hidden.dtype),
-                "noise_embedding_dtype": str(noise_embedding.dtype),
-                "draft_hidden_dtype": str(draft_sample_hidden.dtype),
-                "draft_logits_dtype": str(draft_logits.dtype),
-                "target_logits_dtype": str(output.logits.dtype),
-                "last_tree_start": int(last_tree_start),
-                "last_tree_length": int(last_tree_length),
-                "current_tree_start": int(previous_tree_start),
-                "current_tree_length": int(previous_tree_length),
-                "draft_cache_seq_before": int(draft_cache_seq_before),
-                "draft_cache_seq_after_crop": int(draft_cache_seq_after_crop),
-                "target_cache_seq_before_verify": target_cache_seq_before_verify,
-                "target_cache_seq_after_verify": target_cache_seq_after_verify,
-                "target_cache_seq_after_compact": target_cache_seq_after_compact,
-                "draft_position_ids": _tensor_int_list(draft_position_ids[0]),
-                "root_token": int(root_token[0, 0].item()),
-                "input_ids_tail": _tensor_int_list(output_ids[0, max(0, start - 32) : start + 1]),
-                "block_input_ids": _tensor_int_list(block_output_ids[0, :block_size]),
-                "verify_input_ids": _tensor_int_list(verify_input_ids[0, :previous_tree_length]),
-                "verify_position_ids": _tensor_int_list(verify_position_ids[0, :previous_tree_length]),
-                "node_token_ids": [int(token_id) for token_id in node_token_ids.tolist()],
-                "node_depths": [int(depth) for depth in node_depths.tolist()],
-                "parents": [int(parent) for parent in parents],
-                "child_maps": [
-                    {str(int(token)): int(child) for token, child in child_map.items()}
-                    for child_map in child_maps
-                ],
-                "target_hidden_before_draft": _tensor_probe(draft_context_hidden),
-                "noise_embedding": _tensor_probe(noise_embedding),
-                "draft_sample_hidden": _tensor_probe(draft_sample_hidden),
-                "draft_logits": _tensor_probe(draft_logits),
-                "draft_topk": _topk_debug_rows(
-                    draft_logits[0],
-                    rows=min(ddtree_debug_depths, draft_logits.shape[1]),
-                    topk=ddtree_debug_topk,
-                ),
-                "mask": _compact_attention_debug(
-                    verify_attention_mask,
-                    target_attention_mask,
-                    verify_position_ids,
-                    previous_tree_start,
-                    previous_tree_length,
-                ),
-                "posterior": _tensor_int_list(posterior[0, :previous_tree_length]),
-                "target_logits": _tensor_probe(output.logits[:, :previous_tree_length]),
-                "target_topk_rows": _selected_topk_debug_rows(
-                    output.logits[0, :previous_tree_length],
-                    rows=target_probe_rows,
-                    topk=ddtree_debug_topk,
-                ),
-                "accepted_indices": [int(index) for index in accepted_indices],
-                "accepted_tokens": _tensor_int_list(accepted_tokens[0]),
-                "accepted_length": int(len(accepted_indices)),
-                "next_token": int(next_token),
-                "expected_window": expected_window,
-                "verify_target_hidden": _tensor_stats(verify_target_hidden),
-                "accepted_target_hidden": _tensor_probe(target_hidden),
-            })
-
-        if debug_expected_output_ids is not None:
-            expected_ids = debug_expected_output_ids.to(device=output.logits.device)
-            for local_idx in range(1, len(accepted_indices)):
-                commits_abs = start + local_idx
-                if commits_abs >= expected_ids.shape[1]:
-                    break
-                expected = expected_ids[0, commits_abs]
-                actual = accepted_tokens[0, local_idx]
-                if bool((actual != expected).item()):
-                    logit_idx = accepted_indices[local_idx - 1]
-                    node_index = accepted_indices[local_idx]
-                    path_tokens = accepted_tokens[0].tolist()
-                    emit_verify_mismatch(
-                        f"[DDTREE-VERIFY-MISMATCH] {debug_label} "
-                        f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
-                        f"node_index={node_index} depth={local_idx} "
-                        f"commits_abs={commits_abs} commits_gen={commits_abs - num_input_tokens} "
-                        f"expected={int(expected.item())} committed={int(actual.item())} "
-                        f"accepted_indices={[int(index) for index in accepted_indices]} "
-                        f"next_token={int(next_token)} "
-                        f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
-                        f"committed_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
-                        f"top_logits={format_top_logits(output.logits[0, logit_idx])} "
-                        f"path_tokens={[int(token) for token in path_tokens]}"
-                    )
-                    break
-            else:
-                predicts_abs = start + len(accepted_indices)
-                if predicts_abs < expected_ids.shape[1]:
-                    expected = expected_ids[0, predicts_abs]
-                    actual = torch.tensor(next_token, dtype=expected.dtype, device=expected.device)
-                    if bool((actual != expected).item()):
-                        logit_idx = accepted_indices[-1]
-                        final_node_index = accepted_indices[-1]
-                        path_tokens = accepted_tokens[0].tolist()
-                        emit_verify_mismatch(
-                            f"[DDTREE-VERIFY-MISMATCH] {debug_label} "
-                            f"round_start_abs={start} round_start_gen={start - num_input_tokens} "
-                            f"node_index={final_node_index} depth={len(accepted_indices) - 1} "
-                            f"predicts_abs={predicts_abs} predicts_gen={predicts_abs - num_input_tokens} "
-                            f"expected={int(expected.item())} posterior={int(actual.item())} "
-                            f"accepted_indices={[int(index) for index in accepted_indices]} "
-                            f"expected_logit={float(output.logits[0, logit_idx, expected].float().item()):.6f} "
-                            f"posterior_logit={float(output.logits[0, logit_idx, actual].float().item()):.6f} "
-                            f"top_logits={format_top_logits(output.logits[0, logit_idx])} "
-                            f"path_tokens={[int(token) for token in path_tokens]}"
-                        )
 
         output_ids[:, start : start + len(accepted_indices)] = accepted_tokens
         output_ids[:, start + len(accepted_indices)] = next_token
@@ -1096,7 +621,7 @@ def ddtree_generate(
             new_tokens = output_ids[:, start - len(accepted_indices) : start + 1]
             if torch.isin(new_tokens[0], stop_token_ids_tensor).any():
                 break
-    print("FINAL START", start)
+
     output_ids = output_ids[:, :max_length]
     output_ids = output_ids[:, output_ids[0] != mask_token_id]
     if stop_token_ids_tensor is not None:

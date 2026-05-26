@@ -188,7 +188,6 @@ class Qwen3DFlashAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            # sliding_window=self.sliding_window,
             **kwargs,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1)

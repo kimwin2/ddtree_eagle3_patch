@@ -14,7 +14,6 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 from model.dflash import DFlashDraftModel
-# from specforge.modeling.draft.gauss3_dflash import Gauss3DFlashDraftModel, Gauss3DFlashConfig
 
 from .modules import LittleBitLinear, LittleBitOnDeviceLinear
 from .packing import binary_unpacker, int2_unpacker
@@ -280,12 +279,8 @@ def load_quantized_dflash_model(
         config_dict = read_littlebit_config(model_path)
         quant_args = argparse.Namespace(**config_dict)
 
-    # model = DFlashDraftModel(config)
     model_cls = _get_draft_model_class(config)
-    # print(config)
     model = model_cls(config)
-    # print(model)
-    print(f"[DEBUG] Draft model attention implementation: {model.config._attn_implementation}")
     
     model = apply_littlebit_patch(model, quant_args, do_train=do_train)
     state_dict, was_packed = _load_and_process_state_dict(model_path, torch_dtype)
