@@ -468,8 +468,9 @@ def compile_ddtree_tree(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     current_length = 1 + int(node_token_ids.numel())
 
-    if previous_tree_length > 0:
-        attention_mask_buffer[0, 0, :previous_tree_length, previous_tree_start : previous_tree_start + previous_tree_length] = 0
+    attention_mask_buffer.zero_()
+    # if previous_tree_length > 0:
+    #     attention_mask_buffer[0, 0, :previous_tree_length, previous_tree_start : previous_tree_start + previous_tree_length] = 0
 
     verify_input_ids = verify_input_ids_buffer[:, :current_length]
     verify_input_ids[0, 0] = root_token_id
@@ -713,6 +714,7 @@ def ddtree_generate(
     debug_expected_output_ids: torch.Tensor | None = None,
     debug_label: str = "",
     debug_mismatch_log_limit: int | None = 8,
+    apply_ee = False,
 ) -> SimpleNamespace:
     if block_size <= 1:
         return dflash_generate(
@@ -769,7 +771,7 @@ def ddtree_generate(
 
     output_ids[:, :num_input_tokens] = input_ids
     output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
-    target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+    target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids, apply_ee)
 
     time_to_first_token = cuda_time() - prefill_start
 
@@ -1094,7 +1096,7 @@ def ddtree_generate(
             new_tokens = output_ids[:, start - len(accepted_indices) : start + 1]
             if torch.isin(new_tokens[0], stop_token_ids_tensor).any():
                 break
-
+    print("FINAL START", start)
     output_ids = output_ids[:, :max_length]
     output_ids = output_ids[:, output_ids[0] != mask_token_id]
     if stop_token_ids_tensor is not None:

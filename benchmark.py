@@ -2,7 +2,13 @@ import argparse
 import random
 from itertools import chain
 from pathlib import Path
+import os
 
+os.environ['HF_HOME'] = "/group-volume/bs93.lee/LittleD/hf_cache"
+os.environ['HF_DATASETS_CACHE'] = "/group-volume/bs93.lee/LittleD/hf_cache/datasets"
+os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "true"
 from loguru import logger
 import numpy as np
 import torch
@@ -14,6 +20,8 @@ from model import DFlashDraftModel, Eagle3DraftModel, load_and_process_dataset
 from dflash import dflash_generate
 from ddtree import ddtree_generate, maybe_enable_cpp_compact
 from eagle3 import eagle3_generate, target_generate
+from littlebit import load_quantized_dflash_model
+
 
 
 def get_stop_token_ids(tokenizer, target) -> list[int]:
@@ -162,13 +170,12 @@ def detect_draft_algorithm(draft_name_or_path: str) -> str:
         return "eagle3"
     return "dflash"
 
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument("--draft-name-or-path", type=str, required=True)
     parser.add_argument("--block-size", type=int, default=None)
-    parser.add_argument("--tree-budget", type=str, default="16,32,64,128,256,512,1024")
+    parser.add_argument("--tree-budget", type=str, default="31")
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
@@ -195,6 +202,18 @@ def main() -> None:
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--validate-exact-match", action="store_true")
     parser.add_argument("--fail-on-mismatch", action="store_true")
+    parser.add_argument("--apply-ee", action="store_true")
+
+    parser.add_argument("--draft-type", type=str, default="dflash", choices=["dflash", "littlebit_dflash"])
+    parser.add_argument("--quant-mod", type=str, default="LittleBitLinear")
+    parser.add_argument("--quant-func", type=str, default="STEBinary")
+    parser.add_argument("--split-dim", type=int, default=1024)
+    parser.add_argument("--eff-bit", type=float, default=0.5)
+    parser.add_argument("--kv-factor", type=float, default=1.0)
+    parser.add_argument("--min-split-dim", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--residual", action="store_true")
+    
     args = parser.parse_args()
     if args.fail_on_mismatch:
         args.validate_exact_match = True
@@ -250,20 +269,38 @@ def main() -> None:
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        attn_implementation=target_attn_implementation,
+        attn_implementation="sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
 
     method_key_to_tree_budget = {}
     block_size = args.block_size
     if draft_algorithm == "dflash":
-        draft_model = DFlashDraftModel.from_pretrained(
-            args.draft_name_or_path,
-            attn_implementation=draft_attn_implementation,
-            dtype=torch.bfloat16,
-        ).to(device).eval()
-        if hasattr(draft_model, "configure_for_target"):
-            draft_model.configure_for_target(target)
+        draft_attn_implementation="flex_attention"
+        # draft_model = DFlashDraftModel.from_pretrained(
+        #     args.draft_name_or_path,
+        #     attn_implementation="flex_attention",
+        #     dtype=torch.bfloat16,
+        # ).to(device).eval()
+        # if hasattr(draft_model, "configure_for_target"):
+        #     draft_model.configure_for_target(target)
+        if args.draft_type == "littlebit_dflash":
+            draft_model = load_quantized_dflash_model(
+                args.draft_name_or_path,
+                device=device,
+                torch_dtype=torch.bfloat16,
+                quant_args=args,
+                attn_implementation=draft_attn_implementation,
+            )
+        else:
+            draft_model = DFlashDraftModel.from_pretrained(
+                args.draft_name_or_path,
+                attn_implementation=draft_attn_implementation,
+                dtype=torch.bfloat16,
+            ).to(device).eval()
+
+        # draft_model = torch.compile(draft_model, mode="reduce-overhead", dynamic=True)
+        print("Draft model load done!")
         block_size = args.block_size if args.block_size is not None else draft_model.block_size
         tree_budgets = [int(tree_budget) for tree_budget in args.tree_budget.split(",")]
         methods_to_run = ["dflash"]
@@ -289,7 +326,8 @@ def main() -> None:
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
-        dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
+        # dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
+        dataset = dataset.select(range(args.max_samples))
 
     warmup_input_text = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Warmup"}],
@@ -327,6 +365,7 @@ def main() -> None:
                 block_size=block_size,
                 stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
+                apply_ee=args.apply_ee
             )
         else:
             _ = ddtree_generate(
@@ -339,6 +378,7 @@ def main() -> None:
                 tree_budget=method_key_to_tree_budget[method_key],
                 stop_token_ids=stop_token_ids,
                 temperature=args.temperature,
+                apply_ee=args.apply_ee
             )
 
     responses = []
@@ -386,6 +426,7 @@ def main() -> None:
                         temperature=args.temperature,
                         debug_expected_output_ids=response["baseline"].output_ids if args.validate_exact_match else None,
                         debug_label=f"idx={idx} turn={len(messages) - 1} method={method_key}",
+                        apply_ee=args.apply_ee
                     )
                 else:
                     response[method_key] = ddtree_generate(
@@ -400,6 +441,7 @@ def main() -> None:
                         temperature=args.temperature,
                         debug_expected_output_ids=response["baseline"].output_ids if args.validate_exact_match else None,
                         debug_label=f"idx={idx} turn={len(messages) - 1} method={method_key}",
+                        apply_ee=args.apply_ee
                     )
 
             if args.validate_exact_match:

@@ -54,14 +54,54 @@ def build_sliding_causal_mask(
     sliding_window: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> torch.Tensor:
-    query_positions = torch.arange(kv_len - q_len, kv_len, device=device)
+    is_causal: bool = True,
+):
+    if q_len <= 0:
+        raise ValueError(f"q_len must be positive, got {q_len}")
+    if kv_len < q_len:
+        raise ValueError(f"kv_len must be >= q_len, got kv_len={kv_len}, q_len={q_len}")
+
+    # No sliding window.
+    if sliding_window is None or sliding_window <= 0:
+        if not is_causal:
+            return None
+
+    # DFlash bidirectional draft.
+    if not is_causal and sliding_window is not None and kv_len <= sliding_window:
+        return None
+
     key_positions = torch.arange(kv_len, device=device)
-    visible = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-    if sliding_window is not None and sliding_window > 0:
-        visible &= key_positions.unsqueeze(0) > (query_positions.unsqueeze(1) - sliding_window)
-    mask = torch.full((q_len, kv_len), torch.finfo(dtype).min, dtype=dtype, device=device)
+    query_positions = torch.arange(kv_len - q_len, kv_len, device=device)
+
+    if is_causal:
+        visible = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+
+        if sliding_window is not None and sliding_window > 0:
+            left_bound = query_positions.unsqueeze(1) - sliding_window + 1
+            visible &= key_positions.unsqueeze(0) >= left_bound
+
+    else:
+        # Bidirectional chunk SWA:
+        # keep recent past + current q chunk.
+        # q_len=16, window=2048 -> past 2032 + current 16.
+        past_len = kv_len - q_len
+        past_keep = max(sliding_window - q_len, 0)
+        past_start = max(past_len - past_keep, 0)
+
+        visible_keys = key_positions >= past_start
+        visible = visible_keys.unsqueeze(0).expand(q_len, kv_len)
+
+    if bool(visible.all().item()):
+        return None
+
+    mask = torch.full(
+        (q_len, kv_len),
+        torch.finfo(dtype).min,
+        dtype=dtype,
+        device=device,
+    )
     mask.masked_fill_(visible, 0)
+
     return mask[None, None, :, :]
 
 class Qwen3DFlashAttention(nn.Module):
@@ -111,15 +151,20 @@ class Qwen3DFlashAttention(nn.Module):
         k_noise = self.k_proj(hidden_states)
         v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
+
         k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
+
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
+
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+
         if self.sliding_window is not None:
             sliding_mask = build_sliding_causal_mask(
                 q_len=q_len,
@@ -127,11 +172,14 @@ class Qwen3DFlashAttention(nn.Module):
                 sliding_window=self.sliding_window,
                 dtype=q.dtype,
                 device=q.device,
+                is_causal=self.is_causal,
             )
-            attention_mask = sliding_mask if attention_mask is None else attention_mask + sliding_mask
+            if sliding_mask is not None:
+                attention_mask = sliding_mask if attention_mask is None else attention_mask + sliding_mask
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -140,7 +188,7 @@ class Qwen3DFlashAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,
+            # sliding_window=self.sliding_window,
             **kwargs,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1)

@@ -38,6 +38,7 @@ def dflash_generate(
     debug_expected_output_ids: torch.Tensor | None = None,
     debug_label: str = "",
     debug_mismatch_log_limit: int | None = 8,
+    apply_ee = False,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -68,7 +69,7 @@ def dflash_generate(
     output_ids[:, :num_input_tokens] = input_ids
     output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
     if block_size > 1:
-        target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+        target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids, apply_ee)
 
     time_to_first_token = cuda_time() - prefill_start
 

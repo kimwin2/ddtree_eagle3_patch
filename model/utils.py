@@ -3,7 +3,153 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset, Features, Sequence, Value
+from datasets import load_dataset, Features, Sequence, Value, concatenate_datasets
+import json
+import re
+_AGENT_TARGET_FEATURES = Features({"turns": Sequence(Value("large_string"))})
+
+_TAU2_TASK_URLS = {
+    "airline": "https://huggingface.co/datasets/HuggingFaceH4/tau2-bench-data/resolve/main/domains/airline/tasks.json",
+    "retail": "https://huggingface.co/datasets/HuggingFaceH4/tau2-bench-data/resolve/main/domains/retail/tasks.json",
+}
+
+_BFCL_V3_MULTITURN_URL = (
+    "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/"
+    "resolve/main/BFCL_v3_multi_turn_base.json"
+)
+
+def _to_pretty_text(value, max_chars: int = 6000) -> str:
+    """Robustly stringify nested HF examples without exploding prompt length."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, indent=2)
+        except TypeError:
+            text = str(value)
+
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n... [truncated for speed benchmark prompt]"
+    return text
+
+
+def _flatten_tau2_user_scenario(example: dict) -> str:
+    scenario = example.get("user_scenario", "")
+    if not isinstance(scenario, dict):
+        return _to_pretty_text(scenario)
+
+    instructions = scenario.get("instructions", scenario)
+    if isinstance(instructions, dict):
+        parts = []
+        for key in ("domain", "reason_for_call", "known_info", "unknown_info", "task_instructions"):
+            val = instructions.get(key)
+            if val not in (None, ""):
+                parts.append(f"{key}: {_to_pretty_text(val, max_chars=2000)}")
+        if parts:
+            return "\n".join(parts)
+
+    return _to_pretty_text(scenario)
+
+
+def _format_tau2_prompt(example: dict, domain: str) -> str:
+    task_id = example.get("id", "")
+    description = _to_pretty_text(example.get("description", ""), max_chars=2500)
+    user_scenario = _flatten_tau2_user_scenario(example)
+    initial_state = _to_pretty_text(example.get("initial_state", ""), max_chars=5000)
+    eval_criteria = _to_pretty_text(example.get("evaluation_criteria", ""), max_chars=2500)
+
+    return (
+        f"You are a function-calling customer-support agent for the TAU-bench/{domain} domain.\n"
+        "This is a speed-only benchmark prompt. Do not solve with natural language only; "
+        "use tool-call style reasoning and emit tool calls when needed.\n\n"
+        "Return format when calling a tool:\n"
+        '{"tool_name": "<name>", "arguments": {"<arg>": "<value>"}}\n\n'
+        f"Task id: {task_id}\n\n"
+        f"Task description:\n{description}\n\n"
+        f"User scenario:\n{user_scenario}\n\n"
+        f"Initial state / database slice:\n{initial_state}\n\n"
+        f"Success criteria:\n{eval_criteria}\n\n"
+        "Start by deciding which tool/API calls are needed, then produce the next assistant action."
+    )
+
+
+def _load_tau2_domain(domain: str):
+    if domain not in _TAU2_TASK_URLS:
+        raise ValueError(f"Unsupported tau2 domain: {domain}. Supported: {sorted(_TAU2_TASK_URLS)}")
+
+    raw = load_dataset(
+        "json",
+        data_files={"test": _TAU2_TASK_URLS[domain]},
+        split="test",
+    )
+
+    return raw.map(
+        lambda x: {"turns": [_format_tau2_prompt(x, domain)]},
+        remove_columns=raw.column_names,
+        features=_AGENT_TARGET_FEATURES,
+    )
+
+
+def _flatten_bfcl_question(question) -> str:
+    if isinstance(question, str):
+        return question
+
+    if not isinstance(question, list):
+        return _to_pretty_text(question)
+
+    turns = []
+    for idx, turn in enumerate(question, start=1):
+        messages = turn if isinstance(turn, list) else [turn]
+        msg_texts = []
+
+        for msg in messages:
+            if isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                msg_texts.append(f"{role}: {content}")
+            else:
+                msg_texts.append(_to_pretty_text(msg))
+
+        turns.append(f"Turn {idx}:\n" + "\n".join(msg_texts))
+
+    return "\n\n".join(turns)
+
+
+def _format_bfcl_multiturn_prompt(example: dict) -> str:
+    question = _flatten_bfcl_question(example.get("question", ""))
+    involved_classes = _to_pretty_text(example.get("involved_classes", []), max_chars=1000)
+    tool_path_hint = _to_pretty_text(example.get("path", []), max_chars=2000)
+    initial_config = _to_pretty_text(example.get("initial_config", {}), max_chars=6000)
+
+    return (
+        "You are an agent that solves tasks by calling functions/tools.\n"
+        "This is a speed-only BFCL-style multi-turn benchmark prompt. "
+        "Use function-call style outputs whenever an action requires a tool.\n\n"
+        "Return format when calling a tool:\n"
+        '{"tool_name": "<Class.method>", "arguments": {"<arg>": "<value>"}}\n\n'
+        f"Benchmark id: {example.get('id', '')}\n\n"
+        f"Available tool classes:\n{involved_classes}\n\n"
+        f"Tool/API path hint:\n{tool_path_hint}\n\n"
+        f"Initial environment config:\n{initial_config}\n\n"
+        f"Conversation:\n{question}\n\n"
+        "Produce the next assistant action."
+    )
+
+
+def _load_bfcl_v3_multiturn():
+    raw = load_dataset(
+        "json",
+        data_files={"test": _BFCL_V3_MULTITURN_URL},
+        split="test",
+    )
+
+    return raw.map(
+        lambda x: {"turns": [_format_bfcl_multiturn_prompt(x)]},
+        remove_columns=raw.column_names,
+        features=_AGENT_TARGET_FEATURES,
+    )
 
 def get_text_config(config):
     return getattr(config, "text_config", config)
@@ -53,11 +199,24 @@ def get_dflash_target_layer_ids(
 def extract_context_feature(
     hidden_states: list[torch.Tensor],
     layer_ids: Optional[list[int]],
+    early_exit: bool = False,
 ) -> torch.Tensor:
     offset = 1
     selected_states = []
-    for layer_id in layer_ids:
-        selected_states.append(hidden_states[layer_id + offset])
+    
+    if early_exit:
+        # prefill: 4, 5번째를 3번째로 덮어씌움
+        fix_id = layer_ids[2]
+        for i, layer_id in enumerate(layer_ids):
+            if i > 2:
+                selected_states.append(hidden_states[fix_id + offset])
+            else:
+                selected_states.append(hidden_states[layer_id + offset])
+    else:
+        # decoding: 기존처럼 각 layer의 실제 hidden 사용
+        for layer_id in layer_ids:
+            selected_states.append(hidden_states[layer_id + offset])
+    
     target_hidden = torch.cat(selected_states, dim=-1)
     return target_hidden
 
@@ -167,6 +326,20 @@ def apply_final_logit_softcapping(
     return torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
 
 def load_and_process_dataset(data_name: str):
+    if data_name in ("tau-bench-airline", "taubench-airline", "tau2-airline"):
+        dataset = _load_tau2_domain("airline")
+
+    elif data_name in ("tau-bench-retail", "taubench-retail", "tau2-retail"):
+        dataset = _load_tau2_domain("retail")
+
+    elif data_name in ("tau-bench", "taubench", "tau2-bench"):
+        dataset = concatenate_datasets([
+            _load_tau2_domain("airline"),
+            _load_tau2_domain("retail"),
+        ])
+
+    elif data_name in ("bfcl-v3-multiturn", "bfcl-multiturn", "bfcl"):
+        dataset = _load_bfcl_v3_multiturn()
     # Math datasets
     if data_name == "gsm8k":
         dataset = load_dataset("openai/gsm8k", "main", split="test")
