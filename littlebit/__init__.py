@@ -1,4 +1,4 @@
-from .functions import SmoothSign, STEBinary
+from .functions import STEBinary
 from .modules import LittleBitLinear, LittleBitOnDeviceLinear
 from .utils import (
     apply_littlebit_patch,

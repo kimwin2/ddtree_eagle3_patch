@@ -2,10 +2,11 @@ import argparse
 import random
 from itertools import chain
 from pathlib import Path
+from types import SimpleNamespace
 import os
 
-os.environ['HF_HOME'] = "/group-volume/bs93.lee/LittleD/hf_cache"
-os.environ['HF_DATASETS_CACHE'] = "/group-volume/bs93.lee/LittleD/hf_cache/datasets"
+os.environ['HF_HOME'] = "./hf_cache"
+os.environ['HF_DATASETS_CACHE'] = "./hf_cache/datasets"
 os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "true"
@@ -13,13 +14,12 @@ from loguru import logger
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import distributed as dist
-from model import DFlashDraftModel, Eagle3DraftModel, load_and_process_dataset
-from dflash import dflash_generate
+from model import DFlashDraftModel, load_and_process_dataset, sample
+from dflash import cuda_time, dflash_generate
 from ddtree import ddtree_generate, maybe_enable_cpp_compact
-from eagle3 import eagle3_generate, target_generate
 from littlebit import load_quantized_dflash_model
 
 
@@ -46,44 +46,79 @@ def get_stop_token_ids(tokenizer, target) -> list[int]:
     return sorted(set(stop_token_ids))
 
 
-def detect_draft_algorithm(draft_name_or_path: str) -> str:
-    config = AutoConfig.from_pretrained(draft_name_or_path)
-    architectures = [architecture.lower() for architecture in getattr(config, "architectures", [])]
-    if any("eagle3" in architecture for architecture in architectures):
-        return "eagle3"
-    if "eagle3" in draft_name_or_path.lower():
-        return "eagle3"
-    return "dflash"
+@torch.inference_mode()
+def target_generate(
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    stop_token_ids: list[int],
+    temperature: float = 0.0,
+):
+    num_input_tokens = input_ids.shape[1]
+    max_length = num_input_tokens + max_new_tokens
+    output_ids = torch.empty((1, max_length), dtype=torch.long, device=target.device)
+    output_ids[:, :num_input_tokens] = input_ids
+    position_ids = torch.arange(max_length, device=target.device).unsqueeze(0)
+    stop_token_ids_tensor = None if stop_token_ids is None else torch.tensor(stop_token_ids, device=target.device)
+    past_key_values = None
+
+    prefill_start = cuda_time()
+    output = target(
+        input_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=past_key_values,
+        use_cache=True,
+        logits_to_keep=1,
+    )
+    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
+    past_key_values = output.past_key_values
+    time_to_first_token = cuda_time() - prefill_start
+
+    decode_start = cuda_time()
+    start = num_input_tokens + 1
+    while start < max_length:
+        output = target(
+            output_ids[:, start - 1 : start],
+            position_ids=position_ids[:, start - 1 : start],
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        output_ids[:, start : start + 1] = sample(output.logits, temperature)
+        past_key_values = output.past_key_values
+
+        if stop_token_ids_tensor is not None and torch.isin(output_ids[0, start], stop_token_ids_tensor).any():
+            start += 1
+            break
+        start += 1
+
+    output_ids = output_ids[:, :start]
+    num_output_tokens = output_ids.shape[1] - num_input_tokens
+    total_decode_time = cuda_time() - decode_start
+    time_per_output_token = total_decode_time / max(num_output_tokens, 1)
+
+    return SimpleNamespace(
+        output_ids=output_ids.cpu(),
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=num_output_tokens,
+        time_to_first_token=time_to_first_token,
+        time_per_output_token=time_per_output_token,
+        acceptance_lengths=[1] * num_output_tokens,
+        decode_rounds=num_output_tokens,
+        stage_times={"decode": total_decode_time},
+    )
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument("--draft-name-or-path", type=str, required=True)
     parser.add_argument("--block-size", type=int, default=None)
-    parser.add_argument("--tree-budget", type=str, default="31")
+    parser.add_argument("--tree-budget", type=str, default="31,63")
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--flash-attn", action="store_true")
-    parser.add_argument(
-        "--target-attn-implementation",
-        choices=["auto", "sdpa", "eager", "flash_attention_2"],
-        default="auto",
-        help="Override the target model attention backend.",
-    )
-    parser.add_argument(
-        "--draft-attn-implementation",
-        choices=["auto", "eager", "sdpa", "flash_attention_2"],
-        default="auto",
-        help="Override the DFlash draft model attention backend.",
-    )
     parser.add_argument("--disable-cpp-compact-cache", action="store_true")
-    parser.add_argument("--draft-algorithm", choices=["auto", "dflash", "eagle3"], default="auto")
-    parser.add_argument("--eagle3-batch-size", type=int, default=1)
-    parser.add_argument("--eagle3-depth", type=int, default=7)
-    parser.add_argument("--eagle3-topk", type=int, default=8)
-    parser.add_argument("--eagle3-tree-size", type=int, default=32)
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--apply-ee", action="store_true")
 
@@ -110,87 +145,41 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
     maybe_enable_cpp_compact(not args.disable_cpp_compact_cache)
-    draft_algorithm = detect_draft_algorithm(args.draft_name_or_path) if args.draft_algorithm == "auto" else args.draft_algorithm
+    draft_algorithm = "dflash"
 
-    if draft_algorithm == "eagle3" and args.eagle3_batch_size != 1:
-        raise NotImplementedError("The local Eagle3 benchmark path currently supports batch size 1.")
-
-    def has_flash_attn() -> bool:
-        try:
-            import flash_attn  # noqa: F401
-            return True
-        except ImportError:
-            return False
-
-    installed_flash_attn = has_flash_attn()
-
-    target_attn_implementation = "flash_attention_2" if args.flash_attn else "sdpa"
-    if args.target_attn_implementation != "auto":
-        target_attn_implementation = args.target_attn_implementation
-    if draft_algorithm == "dflash":
-        draft_attn_implementation = (
-            "flash_attention_2"
-            if args.draft_attn_implementation == "auto"
-            else args.draft_attn_implementation
-        )
-        if draft_attn_implementation == "flash_attention_2" and not installed_flash_attn:
-            raise RuntimeError(
-                "flash_attn must be installed when DFlash draft attention uses FlashAttention"
-            )
-    else:
-        draft_attn_implementation = "pytorch"
-
-    if draft_algorithm == "eagle3" and target_attn_implementation == "flash_attention_2":
-        logger.warning("Eagle3 tree verification uses a custom attention mask; forcing the target verifier to torch.sdpa.")
-        target_attn_implementation = "sdpa"
-    elif target_attn_implementation == "sdpa" and installed_flash_attn:
-        logger.warning("DDTree uses a custom tree attention mask on the target model. For compatibility, forcing the target verifier to torch.sdpa.")
-    elif target_attn_implementation == "eager":
-        logger.warning("Loading the target with eager attention.")
+    target_attn_implementation = "sdpa"
+    draft_attn_implementation = "flex_attention"
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        attn_implementation="sdpa",
+        attn_implementation=target_attn_implementation,
         dtype=torch.bfloat16,
     ).to(device).eval()
 
     method_key_to_tree_budget = {}
     block_size = args.block_size
-    if draft_algorithm == "dflash":
-        draft_attn_implementation="flex_attention"
-        if args.draft_type == "littlebit_dflash":
-            draft_model = load_quantized_dflash_model(
-                args.draft_name_or_path,
-                device=device,
-                torch_dtype=torch.bfloat16,
-                quant_args=args,
-                attn_implementation=draft_attn_implementation,
-            )
-        else:
-            draft_model = DFlashDraftModel.from_pretrained(
-                args.draft_name_or_path,
-                attn_implementation=draft_attn_implementation,
-                dtype=torch.bfloat16,
-            ).to(device).eval()
-
-        block_size = args.block_size if args.block_size is not None else draft_model.block_size
-        tree_budgets = [int(tree_budget) for tree_budget in args.tree_budget.split(",")]
-        methods_to_run = ["dflash"]
-        if not args.flash_attn:
-            ddtree_method_keys = [f"ddtree_tb{tree_budget}" for tree_budget in tree_budgets]
-            methods_to_run.extend(ddtree_method_keys)
-            method_key_to_tree_budget.update({f"ddtree_tb{tree_budget}": tree_budget for tree_budget in tree_budgets})
-    else:
-        draft_model = Eagle3DraftModel.from_pretrained(
+    if args.draft_type == "littlebit_dflash":
+        draft_model = load_quantized_dflash_model(
             args.draft_name_or_path,
-            total_tokens=args.eagle3_tree_size,
-            depth=args.eagle3_depth,
-            top_k=args.eagle3_topk,
+            device=device,
+            torch_dtype=torch.bfloat16,
+            quant_args=args,
+            attn_implementation=draft_attn_implementation,
+        )
+    else:
+        draft_model = DFlashDraftModel.from_pretrained(
+            args.draft_name_or_path,
+            attn_implementation=draft_attn_implementation,
             dtype=torch.bfloat16,
         ).to(device).eval()
-        draft_model.tie_target_embeddings(target.get_input_embeddings())
-        draft_model.init_tree()
-        methods_to_run = ["eagle3"]
+
+    block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    tree_budgets = [int(tree_budget) for tree_budget in args.tree_budget.split(",")]
+    methods_to_run = ["dflash"]
+    if not args.flash_attn:
+        ddtree_method_keys = [f"ddtree_tb{tree_budget}" for tree_budget in tree_budgets]
+        methods_to_run.extend(ddtree_method_keys)
+        method_key_to_tree_budget.update({f"ddtree_tb{tree_budget}": tree_budget for tree_budget in tree_budgets})
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     stop_token_ids = get_stop_token_ids(tokenizer, target)
@@ -217,16 +206,7 @@ def main() -> None:
         temperature=args.temperature,
     )
     for method_key in methods_to_run:
-        if method_key == "eagle3":
-            _ = eagle3_generate(
-                model=draft_model,
-                target=target,
-                input_ids=warmup_input_ids,
-                max_new_tokens=warmup_max_new_tokens,
-                stop_token_ids=stop_token_ids,
-                temperature=args.temperature,
-            )
-        elif method_key == "dflash":
+        if method_key == "dflash":
             _ = dflash_generate(
                 model=draft_model,
                 target=target,
@@ -276,16 +256,7 @@ def main() -> None:
                 temperature=args.temperature,
             )
             for method_key in methods_to_run:
-                if method_key == "eagle3":
-                    response[method_key] = eagle3_generate(
-                        model=draft_model,
-                        target=target,
-                        input_ids=input_ids,
-                        max_new_tokens=args.max_new_tokens,
-                        stop_token_ids=stop_token_ids,
-                        temperature=args.temperature,
-                    )
-                elif method_key == "dflash":
+                if method_key == "dflash":
                     response[method_key] = dflash_generate(
                         model=draft_model,
                         target=target,
@@ -327,12 +298,6 @@ def main() -> None:
         "responses": responses,
         "block_size": block_size,
         "draft_algorithm": draft_algorithm,
-        "eagle3_config": {
-            "batch_size": args.eagle3_batch_size,
-            "depth": args.eagle3_depth,
-            "topk": args.eagle3_topk,
-            "tree_size": args.eagle3_tree_size,
-        } if draft_algorithm == "eagle3" else None,
         "draft_attn_implementation": draft_attn_implementation,
         "target_attn_implementation": target_attn_implementation,
         "args": vars(args),

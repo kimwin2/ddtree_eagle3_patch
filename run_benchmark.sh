@@ -29,6 +29,7 @@ COMMON_BENCHMARK_ARGS=(
 
 DRAFT_CONFIGS=(
   "dflash|||||||"
+  # "littlebit_dflash|LittleBitOnDeviceLinear|STEBinary|1.0|2.0|8|128|true"
 )
 
 slugify() {

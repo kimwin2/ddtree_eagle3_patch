@@ -1,5 +1,4 @@
 from .dflash import DFlashDraftModel
-from .eagle3 import Eagle3DraftModel
 from .utils import (
     apply_final_logit_softcapping,
     apply_logit_processing,
