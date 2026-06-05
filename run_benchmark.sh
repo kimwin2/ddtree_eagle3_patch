@@ -13,6 +13,15 @@ EAGLE3_DEPTH="${EAGLE3_DEPTH:-7}"
 EAGLE3_TOPK="${EAGLE3_TOPK:-8}"
 EAGLE3_TREE_SIZE="${EAGLE3_TREE_SIZE:-32}"
 
+# DFlash draft uint16 activation quantization (A16 PTQ, static). Calibration uses
+# the HELD-OUT samples of the eval datasets (those not consumed by eval).
+# Set ENABLE_DRAFT_QUANT=0 to run the original (non-quantized) benchmark.
+ENABLE_DRAFT_QUANT="${ENABLE_DRAFT_QUANT:-1}"
+QUANT_OBSERVER="${QUANT_OBSERVER:-minmax}"
+QUANT_NUM_BITS="${QUANT_NUM_BITS:-16}"
+CALIB_NUM_SAMPLES="${CALIB_NUM_SAMPLES:-128}"
+CALIB_SEQ_LEN="${CALIB_SEQ_LEN:-2048}"
+
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 
 TASKS=(
@@ -38,6 +47,12 @@ TEMPERATURES=(
   "0.0"
   "1.0"
 )
+
+# Calibration spec = the eval tasks; the reader pools each dataset's held-out
+# (not-used-by-eval) samples. Built by joining TASKS with commas, e.g.
+# "gsm8k:128,math500:128,...". Keeping it identical to TASKS guarantees no
+# calibration/eval data leakage.
+CALIB_TASKS_SPEC="$(IFS=,; echo "${TASKS[*]}")"
 
 COMMON_BENCHMARK_ARGS=(
   --max-new-tokens 2048
@@ -98,6 +113,23 @@ for task in "${TASKS[@]}"; do
 
     model_slug="$(slugify "${model_name}")"
     draft_slug="$(slugify "${draft_name}")"
+
+    # Calibrated qparams are independent of dataset/temperature, so calibrate
+    # once per (target, draft) pair and reuse via this cache across all runs.
+    quant_cache_path="${RUN_DIR}/qparams__${model_slug}__${draft_slug}__${QUANT_OBSERVER}_b${QUANT_NUM_BITS}.pt"
+    QUANT_ARGS=()
+    if [[ "${ENABLE_DRAFT_QUANT}" == "1" ]]; then
+      QUANT_ARGS=(
+        --draft-activation-quant
+        --quant-observer "${QUANT_OBSERVER}"
+        --quant-num-bits "${QUANT_NUM_BITS}"
+        --calib-num-samples "${CALIB_NUM_SAMPLES}"
+        --calib-seq-len "${CALIB_SEQ_LEN}"
+        --calib-holdout-tasks "${CALIB_TASKS_SPEC}"
+        --quant-cache-path "${quant_cache_path}"
+      )
+    fi
+
     for temperature in "${TEMPERATURES[@]}"; do
       temperature_slug="$(slugify "${temperature}")"
       run_name="${dataset_name}__${model_slug}__${draft_slug}__temp${temperature_slug}"
@@ -127,7 +159,8 @@ for task in "${TASKS[@]}"; do
           "sdpa" \
           "${RUN_DIR}/${run_name}__sdpa.pt" \
           "${LOG_DIR}/${run_name}__sdpa.log" \
-          --temperature "${temperature}"
+          --temperature "${temperature}" \
+          "${QUANT_ARGS[@]+"${QUANT_ARGS[@]}"}"
 
         run_benchmark \
           "${dataset_name}" \
@@ -138,7 +171,8 @@ for task in "${TASKS[@]}"; do
           "${RUN_DIR}/${run_name}__flash_attn.pt" \
           "${LOG_DIR}/${run_name}__flash_attn.log" \
           --temperature "${temperature}" \
-          --flash-attn
+          --flash-attn \
+          "${QUANT_ARGS[@]+"${QUANT_ARGS[@]}"}"
       fi
     done
   done

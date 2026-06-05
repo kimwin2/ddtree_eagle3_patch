@@ -10,7 +10,15 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import distributed as dist
-from model import DFlashDraftModel, Eagle3DraftModel, load_and_process_dataset
+from model import (
+    DFlashDraftModel,
+    Eagle3DraftModel,
+    load_and_process_dataset,
+    CalibrationDataReader,
+    calibrate_dflash_activations,
+    export_qparams,
+    load_qparams,
+)
 from dflash import dflash_generate
 from ddtree import ddtree_generate, maybe_enable_cpp_compact
 from eagle3 import eagle3_generate, target_generate
@@ -195,6 +203,50 @@ def main() -> None:
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--validate-exact-match", action="store_true")
     parser.add_argument("--fail-on-mismatch", action="store_true")
+    # --- DFlash draft activation quantization (uint16 fake quant, A16 PTQ) --- #
+    parser.add_argument(
+        "--draft-activation-quant",
+        action="store_true",
+        help="Apply uint16 asymmetric per-tensor fake activation quantization to the DFlash draft model.",
+    )
+    parser.add_argument("--quant-num-bits", type=int, default=16, help="Activation quantization bit-width (uint).")
+    parser.add_argument(
+        "--quant-observer",
+        choices=["minmax", "percentile"],
+        default="minmax",
+        help="Calibration observer: min-max (default) or percentile/histogram for heavy outliers.",
+    )
+    parser.add_argument("--quant-percentile", type=float, default=99.99, help="Percentile for the percentile observer.")
+    parser.add_argument("--quant-num-bins", type=int, default=2048, help="Histogram bins for the percentile observer.")
+    parser.add_argument("--calib-num-samples", type=int, default=128, help="Number of calibration sequences.")
+    parser.add_argument("--calib-seq-len", type=int, default=2048, help="Deployment context length per calibration sequence.")
+    parser.add_argument(
+        "--calib-prompt-len",
+        type=int,
+        default=None,
+        help="Prompt tokens kept per calibration sample (default: calib-seq-len // 2).",
+    )
+    parser.add_argument(
+        "--calib-dataset",
+        type=str,
+        default=None,
+        help="Single dataset used for calibration (defaults to --dataset). Ignored if --calib-holdout-tasks is set.",
+    )
+    parser.add_argument(
+        "--calib-holdout-tasks",
+        type=str,
+        default=None,
+        help=(
+            "Eval-task spec 'name:max,name:max' (same format as run_benchmark.sh TASKS). "
+            "Calibrates on the HELD-OUT samples not used by eval, pooled across these datasets."
+        ),
+    )
+    parser.add_argument(
+        "--quant-cache-path",
+        type=str,
+        default=None,
+        help="Path to save/load calibrated activation qparams to skip recalibration.",
+    )
     args = parser.parse_args()
     if args.fail_on_mismatch:
         args.validate_exact_match = True
@@ -287,6 +339,69 @@ def main() -> None:
     stop_token_ids = get_stop_token_ids(tokenizer, target)
     logger.info(f"Using stop_token_ids={stop_token_ids}")
     dataset = load_and_process_dataset(args.dataset)
+
+    if args.draft_activation_quant:
+        if draft_algorithm != "dflash":
+            raise ValueError("--draft-activation-quant is only supported for the dflash draft model (not eagle3).")
+        quant_config = {
+            "num_bits": args.quant_num_bits,
+            "observer": args.quant_observer,
+            "percentile": args.quant_percentile,
+            "num_bins": args.quant_num_bins,
+        }
+        cache_path = Path(args.quant_cache_path) if args.quant_cache_path else None
+        if cache_path is not None and cache_path.exists():
+            draft_model.configure_activation_quant(quant_config)
+            cached = torch.load(cache_path, map_location=device)
+            num_loaded = load_qparams(draft_model, cached["qparams"])
+            draft_model.set_activation_quant_enabled(True)
+            logger.info(f"Loaded {num_loaded} calibrated activation quantizers from {cache_path}")
+        else:
+            if args.calib_holdout_tasks:
+                logger.info(
+                    f"Calibrating dflash activations on HELD-OUT data: tasks={args.calib_holdout_tasks} "
+                    f"samples={args.calib_num_samples} seq_len={args.calib_seq_len} "
+                    f"observer={args.quant_observer} num_bits={args.quant_num_bits}"
+                )
+                reader = CalibrationDataReader(
+                    tokenizer=tokenizer,
+                    eval_tasks=args.calib_holdout_tasks,
+                    num_samples=args.calib_num_samples,
+                    seq_len=args.calib_seq_len,
+                    prompt_len=args.calib_prompt_len,
+                )
+            else:
+                calib_dataset = args.calib_dataset or args.dataset
+                logger.info(
+                    f"Calibrating dflash activations: dataset={calib_dataset} "
+                    f"samples={args.calib_num_samples} seq_len={args.calib_seq_len} "
+                    f"observer={args.quant_observer} num_bits={args.quant_num_bits}"
+                )
+                reader = CalibrationDataReader(
+                    tokenizer=tokenizer,
+                    dataset_name=calib_dataset,
+                    num_samples=args.calib_num_samples,
+                    seq_len=args.calib_seq_len,
+                    prompt_len=args.calib_prompt_len,
+                )
+            summary = calibrate_dflash_activations(
+                model=draft_model,
+                target=target,
+                reader=reader,
+                block_size=block_size,
+                temperature=args.temperature,
+                quant_config=quant_config,
+                enable_after=True,
+                progress=dist.is_main(),
+            )
+            logger.info(f"Calibrated dflash activations: {summary}")
+            if cache_path is not None and dist.is_main():
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {"qparams": export_qparams(draft_model), "summary": summary, "quant_config": quant_config},
+                    cache_path,
+                )
+                logger.info(f"Saved activation qparams to {cache_path}")
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
         dataset = dataset.shuffle(seed=0).select(range(args.max_samples))

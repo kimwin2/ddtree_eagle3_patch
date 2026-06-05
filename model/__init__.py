@@ -1,5 +1,19 @@
 from .dflash import DFlashDraftModel
 from .eagle3 import Eagle3DraftModel
+from .quant import (
+    FakeQuantize,
+    compute_all_qparams,
+    configure_fake_quants,
+    export_qparams,
+    load_qparams,
+    set_enabled as set_activation_quant_enabled,
+    set_observing as set_activation_quant_observing,
+)
+from .calibration import (
+    CalibrationDataReader,
+    calibrate_dflash_activations,
+    parse_eval_tasks,
+)
 from .utils import (
     apply_final_logit_softcapping,
     apply_logit_processing,

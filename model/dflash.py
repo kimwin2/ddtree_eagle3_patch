@@ -29,6 +29,35 @@ from .utils import (
     get_model_text_config,
     sample,
 )
+from .quant import (
+    FakeQuantize,
+    compute_all_qparams,
+    configure_fake_quants,
+    set_enabled,
+    set_observing,
+)
+
+
+class QuantQwen3MLP(Qwen3MLP):
+    """Qwen3 SwiGLU MLP with fake-quant on every internal activation boundary.
+
+    Identical numerics to ``Qwen3MLP`` while the quantizers are disabled, so it
+    is a drop-in replacement for the draft model in both quantized and
+    non-quantized runs.
+    """
+
+    def __init__(self, config: Qwen3Config) -> None:
+        super().__init__(config)
+        self.q_gate = FakeQuantize()   # gate_proj output (matmul output)
+        self.q_up = FakeQuantize()     # up_proj output (matmul output)
+        self.q_act = FakeQuantize()    # silu(gate) * up  (down_proj input)
+        self.q_down = FakeQuantize()   # down_proj output
+
+    def forward(self, hidden_states):
+        gate = self.q_gate(self.gate_proj(hidden_states))
+        up = self.q_up(self.up_proj(hidden_states))
+        intermediate = self.q_act(self.act_fn(gate) * up)
+        return self.q_down(self.down_proj(intermediate))
 
 def set_default_rope_theta(config: Qwen3Config, default_theta: float = 1000000.0) -> None:
     rope_parameters = getattr(config, "rope_parameters", None)
@@ -91,6 +120,13 @@ class Qwen3DFlashAttention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        # Fake-quant at the attention matmul boundaries (Q, K, V into the
+        # attention op, and the attention output into o_proj / out of o_proj).
+        self.q_query = FakeQuantize()
+        self.q_key = FakeQuantize()
+        self.q_value = FakeQuantize()
+        self.q_attn_out = FakeQuantize()
+        self.q_o_proj = FakeQuantize()
 
     def forward(
         self,
@@ -117,6 +153,9 @@ class Qwen3DFlashAttention(nn.Module):
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q = self.q_query(q)
+        k = self.q_key(k)
+        v = self.q_value(v)
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
@@ -144,7 +183,8 @@ class Qwen3DFlashAttention(nn.Module):
             **kwargs,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1)
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.q_attn_out(attn_output)
+        attn_output = self.q_o_proj(self.o_proj(attn_output))
         return attn_output, attn_weights
 
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
@@ -152,9 +192,15 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
-        self.mlp = Qwen3MLP(config)
+        self.mlp = QuantQwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Fake-quant at the layer's activation boundaries: norm outputs (which
+        # feed the attention / MLP matmuls) and the residual-stream tensors.
+        self.q_input_ln = FakeQuantize()
+        self.q_post_attn = FakeQuantize()
+        self.q_post_attn_ln = FakeQuantize()
+        self.q_post_mlp = FakeQuantize()
 
     def forward(
         self,
@@ -170,7 +216,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.q_input_ln(self.input_layernorm(hidden_states))
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -183,11 +229,11 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )[0]
-        hidden_states = residual + hidden_states
+        hidden_states = self.q_post_attn(residual + hidden_states)
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.q_post_attn_ln(self.post_attention_layernorm(hidden_states))
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = self.q_post_mlp(residual + hidden_states)
         return hidden_states
 
 class DFlashDraftModel(Qwen3PreTrainedModel):
@@ -221,7 +267,30 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.mask_token_id = drafter_config.get("mask_token_id", getattr(config, "mask_token_id", None))
         self.logit_scale = get_logit_scale(config)
         self.final_logit_softcapping = get_final_logit_softcapping(config)
+        # Activation fake-quant at the draft's input/output boundaries:
+        #   q_noise_embedding  -> the draft input (embedded target tokens)
+        #   q_target_hidden    -> the 5 hidden states the target sends to draft
+        #   q_fc / q_hidden_norm -> after the fc projection (and its norm)
+        #   q_output           -> the final draft output
+        self.q_noise_embedding = FakeQuantize()
+        self.q_target_hidden = FakeQuantize()
+        self.q_fc = FakeQuantize()
+        self.q_hidden_norm = FakeQuantize()
+        self.q_output = FakeQuantize()
         self.post_init()
+
+    # --- Activation fake-quant control -------------------------------------- #
+    def configure_activation_quant(self, quant_config: Optional[dict] = None) -> int:
+        return configure_fake_quants(self, quant_config)
+
+    def set_activation_quant_observing(self, observing: bool) -> None:
+        set_observing(self, observing)
+
+    def set_activation_quant_enabled(self, enabled: bool) -> None:
+        set_enabled(self, enabled)
+
+    def finalize_activation_quant(self) -> int:
+        return compute_all_qparams(self)
 
     def configure_for_target(self, target) -> None:
         target_config = get_model_text_config(target)
@@ -248,8 +317,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+        hidden_states = self.q_noise_embedding(noise_embedding)
+        target_hidden = self.q_target_hidden(target_hidden)
+        target_hidden = self.q_fc(self.fc(target_hidden))
+        target_hidden = self.q_hidden_norm(self.hidden_norm(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(
@@ -262,7 +333,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        return self.norm(hidden_states)
+        return self.q_output(self.norm(hidden_states))
     
     @torch.inference_mode()
     def spec_generate(
