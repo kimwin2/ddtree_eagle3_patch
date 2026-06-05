@@ -17,6 +17,7 @@ from model import (
     CalibrationDataReader,
     calibrate_dflash_activations,
     export_qparams,
+    format_quant_summary,
     load_qparams,
 )
 from dflash import dflash_generate
@@ -356,6 +357,15 @@ def main() -> None:
             num_loaded = load_qparams(draft_model, cached["qparams"])
             draft_model.set_activation_quant_enabled(True)
             logger.info(f"Loaded {num_loaded} calibrated activation quantizers from {cache_path}")
+            if dist.is_main():
+                cached_summary = cached.get("summary", {})
+                print(
+                    f"[CALIB] loaded qparams from cache (no recalibration). "
+                    f"datasets={cached_summary.get('dataset_counts', cached_summary.get('datasets'))}. "
+                    f"Delete {cache_path} to force recalibration and see fresh min/max.",
+                    flush=True,
+                )
+                print(format_quant_summary(draft_model), flush=True)
         else:
             if args.calib_holdout_tasks:
                 logger.info(
@@ -369,6 +379,7 @@ def main() -> None:
                     num_samples=args.calib_num_samples,
                     seq_len=args.calib_seq_len,
                     prompt_len=args.calib_prompt_len,
+                    verbose=dist.is_main(),
                 )
             else:
                 calib_dataset = args.calib_dataset or args.dataset
@@ -383,6 +394,7 @@ def main() -> None:
                     num_samples=args.calib_num_samples,
                     seq_len=args.calib_seq_len,
                     prompt_len=args.calib_prompt_len,
+                    verbose=dist.is_main(),
                 )
             summary = calibrate_dflash_activations(
                 model=draft_model,
@@ -393,6 +405,7 @@ def main() -> None:
                 quant_config=quant_config,
                 enable_after=True,
                 progress=dist.is_main(),
+                print_summary=dist.is_main(),
             )
             logger.info(f"Calibrated dflash activations: {summary}")
             if cache_path is not None and dist.is_main():

@@ -14,6 +14,7 @@ from typing import Iterator, Optional
 import torch
 from transformers import DynamicCache
 
+from .quant import format_quant_summary
 from .utils import (
     apply_logit_processing,
     compute_target_lm_logits,
@@ -83,6 +84,7 @@ class CalibrationDataReader:
         seed: int = 0,
         enable_thinking: bool = False,
         eval_tasks=None,
+        verbose: bool = True,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_samples = int(num_samples)
@@ -90,7 +92,9 @@ class CalibrationDataReader:
         self.prompt_len = int(prompt_len) if prompt_len is not None else max(1, self.seq_len // 2)
         self.enable_thinking = enable_thinking
         self.seed = int(seed)
+        self.verbose = verbose
         self.source_datasets: list[str] = []
+        self.dataset_counts: dict[str, int] = {}
 
         if eval_tasks is not None:
             self._prompts = self._build_heldout_prompts(parse_eval_tasks(eval_tasks))
@@ -100,6 +104,7 @@ class CalibrationDataReader:
                 dataset = dataset.shuffle(seed=self.seed).select(range(self.num_samples))
             self._prompts = self._encode_dataset(dataset, limit=self.num_samples)
             self.source_datasets = [dataset_name]
+            self.dataset_counts = {dataset_name: len(self._prompts)}
         else:
             raise ValueError("CalibrationDataReader requires either dataset_name or eval_tasks.")
         self._cursor = 0
@@ -130,42 +135,71 @@ class CalibrationDataReader:
         return prompts
 
     def _build_heldout_prompts(self, eval_tasks: list[tuple[str, Optional[int]]]) -> list[torch.Tensor]:
-        pools: list[list[torch.Tensor]] = []
+        named_pools: list[tuple[str, list[torch.Tensor]]] = []
+        if self.verbose:
+            print(
+                f"[CALIB] building held-out calibration pool (seed={self.seed}, "
+                f"target={self.num_samples} samples) from {len(eval_tasks)} eval datasets",
+                flush=True,
+            )
         for name, eval_max in eval_tasks:
             dataset = load_and_process_dataset(name)
+            total = len(dataset)
             # Mirror eval: it only sub-selects when len(dataset) > eval_max.
             # Otherwise the whole dataset is used and there is no holdout.
-            if eval_max is None or len(dataset) <= eval_max:
+            if eval_max is None or total <= eval_max:
+                if self.verbose:
+                    print(
+                        f"[CALIB]   {name:<16} total={total:<6} eval_used={eval_max} "
+                        f"holdout=0 (fully consumed by eval -> skipped)",
+                        flush=True,
+                    )
                 continue
-            held = dataset.shuffle(seed=self.seed).select(range(eval_max, len(dataset)))
+            held = dataset.shuffle(seed=self.seed).select(range(eval_max, total))
+            held_total = len(held)
             # We never need more than num_samples from a single dataset; cap the
             # encoding work. The holdout is already shuffled, so the head of the
             # tail is a representative deterministic sample.
-            if len(held) > self.num_samples:
+            if held_total > self.num_samples:
                 held = held.select(range(self.num_samples))
             pool = self._encode_dataset(held)
+            if self.verbose:
+                print(
+                    f"[CALIB]   {name:<16} total={total:<6} eval_used={eval_max:<6} "
+                    f"holdout_available={held_total:<6} encoded={len(pool)}",
+                    flush=True,
+                )
             if pool:
-                pools.append(pool)
+                named_pools.append((name, pool))
                 self.source_datasets.append(name)
-        if not pools:
+        if not named_pools:
             raise ValueError(
                 "No held-out calibration data: every eval dataset is fully consumed by eval. "
                 "Reduce per-dataset eval max_samples or pass an explicit --calib-dataset."
             )
         # Round-robin interleave across datasets so the 128 samples stay diverse.
         prompts: list[torch.Tensor] = []
+        counts: dict[str, int] = {name: 0 for name, _ in named_pools}
         idx = 0
         while len(prompts) < self.num_samples:
             progressed = False
-            for pool in pools:
+            for name, pool in named_pools:
                 if idx < len(pool):
                     prompts.append(pool[idx])
+                    counts[name] += 1
                     progressed = True
                     if len(prompts) >= self.num_samples:
                         break
             if not progressed:
                 break
             idx += 1
+        self.dataset_counts = {name: count for name, count in counts.items() if count > 0}
+        if self.verbose:
+            composition = ", ".join(f"{name}={count}" for name, count in self.dataset_counts.items())
+            print(
+                f"[CALIB] held-out pool composition ({len(prompts)} samples): {composition}",
+                flush=True,
+            )
         return prompts
 
     def __len__(self) -> int:
@@ -280,6 +314,7 @@ def calibrate_dflash_activations(
     quant_config: Optional[dict] = None,
     enable_after: bool = True,
     progress: bool = True,
+    print_summary: bool = True,
 ) -> dict:
     """Calibrate and freeze the draft model's activation quantizers.
 
@@ -296,6 +331,13 @@ def calibrate_dflash_activations(
         raise ValueError("Activation calibration requires the draft path (block_size > 1).")
 
     num_configured = model.configure_activation_quant(quant_config)
+    if print_summary:
+        composition = ", ".join(f"{name}={count}" for name, count in reader.dataset_counts.items())
+        print(
+            f"[CALIB] starting observation: {len(reader)} sequences, seq_len={reader.seq_len}, "
+            f"block_size={block_size}, {num_configured} quantizers | datasets: {composition}",
+            flush=True,
+        )
 
     was_training = model.training
     model.eval()
@@ -328,6 +370,14 @@ def calibrate_dflash_activations(
     if was_training:
         model.train()
 
+    if print_summary:
+        print(
+            f"[CALIB] per-layer activation min/max after {len(reader)} sequences "
+            f"({total_rounds} decode rounds):",
+            flush=True,
+        )
+        print(format_quant_summary(model), flush=True)
+
     return {
         "num_quantizers": num_configured,
         "num_calibrated": num_calibrated,
@@ -336,5 +386,6 @@ def calibrate_dflash_activations(
         "seq_len": reader.seq_len,
         "prompt_len": reader.prompt_len,
         "datasets": list(reader.source_datasets),
+        "dataset_counts": dict(reader.dataset_counts),
         "quant_config": quant_config or {},
     }

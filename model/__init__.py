@@ -5,7 +5,9 @@ from .quant import (
     compute_all_qparams,
     configure_fake_quants,
     export_qparams,
+    format_quant_summary,
     load_qparams,
+    quant_summary,
     set_enabled as set_activation_quant_enabled,
     set_observing as set_activation_quant_observing,
 )

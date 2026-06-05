@@ -69,6 +69,9 @@ class MinMaxObserver(nn.Module):
     def compute_min_max(self) -> tuple[float, float]:
         return float(self.min_val.item()), float(self.max_val.item())
 
+    def raw_min_max(self) -> tuple[float, float]:
+        return float(self.min_val.item()), float(self.max_val.item())
+
     def reset(self) -> None:
         self.min_val.fill_(float("inf"))
         self.max_val.fill_(float("-inf"))
@@ -163,6 +166,9 @@ class HistogramObserver(nn.Module):
         if clipped_max <= clipped_min:
             clipped_max = clipped_min + 1e-8
         return clipped_min, clipped_max
+
+    def raw_min_max(self) -> tuple[float, float]:
+        return float(self.range_min.item()), float(self.range_max.item())
 
     def reset(self) -> None:
         self.histogram.zero_()
@@ -329,6 +335,58 @@ def configure_fake_quants(model: nn.Module, quant_config: Optional[dict]) -> int
         )
         count += 1
     return count
+
+
+def quant_summary(model: nn.Module) -> list[dict]:
+    """Return per-quantizer observed min/max and calibrated qparams."""
+    rows: list[dict] = []
+    for name, fq in iter_fake_quants(model):
+        observer = fq.observer
+        if hasattr(observer, "raw_min_max"):
+            raw_min, raw_max = observer.raw_min_max()
+        else:
+            raw_min = raw_max = float("nan")
+        if observer.has_stats():
+            calib_min, calib_max = observer.compute_min_max()
+        else:
+            calib_min = calib_max = float("nan")
+        rows.append(
+            {
+                "name": name,
+                "observer": fq.observer_kind,
+                "min": raw_min,
+                "max": raw_max,
+                "calib_min": calib_min,
+                "calib_max": calib_max,
+                "scale": float(fq.scale.item()),
+                "zero_point": float(fq.zero_point.item()),
+                "calibrated": bool(fq.calibrated),
+            }
+        )
+    return rows
+
+
+def format_quant_summary(model: nn.Module) -> str:
+    """Human-readable table of every quantizer's min/max and qparams."""
+    rows = quant_summary(model)
+    header = (
+        f"{'layer (quantizer)':<48} {'obs':<10} "
+        f"{'min':>14} {'max':>14} {'calib_min':>14} {'calib_max':>14} "
+        f"{'scale':>14} {'zero_pt':>10} {'ok':>3}"
+    )
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        lines.append(
+            f"{row['name']:<48} {row['observer']:<10} "
+            f"{row['min']:>14.6g} {row['max']:>14.6g} "
+            f"{row['calib_min']:>14.6g} {row['calib_max']:>14.6g} "
+            f"{row['scale']:>14.6g} {row['zero_point']:>10.6g} "
+            f"{('Y' if row['calibrated'] else 'n'):>3}"
+        )
+    calibrated = sum(1 for row in rows if row["calibrated"])
+    lines.append("-" * len(header))
+    lines.append(f"total quantizers={len(rows)} calibrated={calibrated}")
+    return "\n".join(lines)
 
 
 def make_fake_quant(quant_config: Optional[dict]) -> FakeQuantize:
