@@ -18,7 +18,7 @@ cd "${REPO_ROOT}"
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
 DRAFT="${DRAFT:-z-lab/Qwen3-8B-DFlash-b16}"
 GPUS="${GPUS:-0,1,2}"                      # baseline,dflash,ddtree (in that order)
-MODEL_LABEL="${MODEL_LABEL:-Gauss 4.0}"
+MODEL_LABEL="${MODEL_LABEL:-Gemma4-E2B}"
 TREE_BUDGET="${TREE_BUDGET:-256}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.0}"

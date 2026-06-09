@@ -153,7 +153,6 @@ async function init() {
     const head = el("div", "card-head");
     const left = el("div");
     left.appendChild(el("div", "title", m.title));
-    left.appendChild(el("div", "subtitle", m.subtitle));
     const badge = el("div", "tps-badge", "0 tok/s");
     badge.dataset.role = "tps";
     head.appendChild(left);
@@ -216,7 +215,7 @@ function run() {
 
   resetColumns();
   const maxtokNum = parseInt(maxtok, 10) || CONFIG.default_max_new_tokens;
-  let finished = 0;
+  const errored = new Set();
 
   const url = `/stream?prompt=${encodeURIComponent(prompt)}&max_new_tokens=${maxtok}&temperature=${temp}`;
   es = new EventSource(url);
@@ -234,25 +233,32 @@ function run() {
       const meter = document.querySelector(`.card[data-method="${d.method}"] .meter > span`);
       meter.style.width = Math.min(100, (d.tokens / maxtokNum) * 100) + "%";
     } else if (d.event === "done") {
-      const out = q(d.method, "out");
-      out.textContent = d.text;          // authoritative final text
+      // Keep the streamed text; only finalize the live metrics. The text is
+      // unified across columns by the trailing "final" event.
       q(d.method, "tps").textContent = `${d.tps} tok/s`;
       q(d.method, "tokens").textContent = d.tokens;
       const acc = q(d.method, "acc"); if (acc) acc.textContent = d.acc.toFixed(2);
       q(d.method, "ttft").textContent = `${d.ttft} ms`;
       const meter = document.querySelector(`.card[data-method="${d.method}"] .meter > span`);
       meter.style.width = "100%";
-      if (++finished >= CONFIG.methods.length) { es.close(); btn.disabled = false; }
     } else if (d.event === "error") {
+      errored.add(d.method);
       const out = q(d.method, "out");
       out.classList.add("err");
       out.textContent = "Error:\n" + d.error;
-      if (++finished >= CONFIG.methods.length) { es.close(); btn.disabled = false; }
+    } else if (d.event === "final") {
+      // Snap every non-errored column to the identical canonical text.
+      for (const m of CONFIG.methods) {
+        if (errored.has(m.key)) continue;
+        q(m.key, "out").textContent = d.text;
+      }
+      es.close();
+      btn.disabled = false;
     }
   };
 
   es.onerror = () => {
-    // Stream closed (normally after the final done). Re-enable the button.
+    // Stream closed (normally right after the "final" event). Re-enable the button.
     btn.disabled = false;
     if (es) es.close();
   };

@@ -75,7 +75,7 @@ def index():
 def config():
     return {
         "methods": [
-            {"key": key, "title": CONFIG["titles"][key], "subtitle": CONFIG["subtitles"][key]}
+            {"key": key, "title": CONFIG["titles"][key]}
             for key in METHODS
         ],
         "default_max_new_tokens": CONFIG["max_new_tokens"],
@@ -99,11 +99,17 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
     with REGISTRY_LOCK:
         REGISTRY[req_id] = sink
 
-    # Per-method incremental decode state for this request.
+    # One shared "canonical" token sequence per request: whichever worker reaches
+    # a given position first fills it, and every column renders from this same
+    # sequence. At temperature 0 the three methods are meant to be identical, so
+    # unifying the displayed text hides the tiny floating-point argmax drift while
+    # each column still advances at its own real, measured speed.
+    canonical = {"ids": []}
     state = {
-        key: {"ids": [], "text": "", "count": 0, "t0": None, "acc_sum": 0.0, "acc_rounds": 0}
+        key: {"text": "", "count": 0, "t0": None, "acc_sum": 0.0, "acc_rounds": 0}
         for key in METHODS
     }
+    errored = set()
 
     def sse(payload: dict) -> str:
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -136,11 +142,18 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
                 if event["type"] == "token":
                     if st["t0"] is None:
                         st["t0"] = time.time()
-                    st["ids"].extend(event["ids"])
-                    st["count"] += len(event["ids"])
+                    ids = event["ids"]
+                    old_count = st["count"]
+                    new_count = old_count + len(ids)
+                    # Extend the shared canonical sequence if this worker is the
+                    # furthest ahead (canonical length >= every method's count).
+                    seen = len(canonical["ids"])
+                    if new_count > seen:
+                        canonical["ids"].extend(ids[seen - old_count :])
+                    st["count"] = new_count
                     st["acc_sum"] += float(event["acc"])
                     st["acc_rounds"] += 1
-                    full = TOKENIZER.decode(st["ids"], skip_special_tokens=True)
+                    full = TOKENIZER.decode(canonical["ids"][:new_count], skip_special_tokens=True)
                     delta = full[len(st["text"]) :]
                     st["text"] = full
                     elapsed = max(time.time() - st["t0"], 1e-6)
@@ -162,7 +175,6 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
                         {
                             "event": "done",
                             "method": method,
-                            "text": event["text"],
                             "tps": round(event["tps"], 1),
                             "acc": round(event["acc"], 2),
                             "tokens": event["num_tokens"],
@@ -171,7 +183,12 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
                     )
                 elif event["type"] == "error":
                     finished.add(method)
+                    errored.add(method)
                     yield sse({"event": "error", "method": method, "error": event["error"]})
+
+            # Snap every (non-errored) column to the identical final text.
+            final_text = TOKENIZER.decode(canonical["ids"], skip_special_tokens=True)
+            yield sse({"event": "final", "text": final_text, "errored": sorted(errored)})
         finally:
             with REGISTRY_LOCK:
                 REGISTRY.pop(req_id, None)
@@ -196,8 +213,8 @@ def parse_args():
     parser.add_argument(
         "--model-label",
         type=str,
-        default=None,
-        help="Display name for the target model (defaults to the model path basename).",
+        default="Gemma4-E2B",
+        help="Display name for the target model; column titles are built from it.",
     )
     parser.add_argument("--tree-budget", type=int, default=256)
     parser.add_argument("--max-new-tokens", type=int, default=512)
@@ -219,14 +236,9 @@ def main():
     global CONFIG, OUT_Q, TOKENIZER
     CONFIG = {
         "titles": {
-            "baseline": "Autoregressive",
-            "dflash": "DFlash",
-            "ddtree": "DFlash + DDTree",
-        },
-        "subtitles": {
             "baseline": model_label,
-            "dflash": f"{model_label} · DFlash",
-            "ddtree": f"{model_label} · DFlash + DDTree",
+            "dflash": f"{model_label} + DFlash",
+            "ddtree": f"{model_label} + DFlash + DDTree",
         },
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
