@@ -34,7 +34,23 @@ pip install -r requirements.txt          # repo root deps
 pip install -r demo/requirements.txt     # fastapi + uvicorn
 ```
 
-## Run (server with 3 GPUs)
+## Run (one shot)
+
+```bash
+bash demo/run_demo.sh
+```
+
+Everything is overridable via env vars:
+
+```bash
+GPUS=2,3,4 MODEL="Qwen/Qwen3-4B" DRAFT="z-lab/Qwen3-4B-DFlash-b16" \
+  MODEL_LABEL="Gauss 4.0" PORT=9000 bash demo/run_demo.sh
+```
+
+`run_demo.sh` installs `demo/requirements.txt` (skip with `INSTALL_DEPS=0`) and
+then launches the server below.
+
+## Run (manual, 3 GPUs)
 
 ```bash
 python -m demo.server \
