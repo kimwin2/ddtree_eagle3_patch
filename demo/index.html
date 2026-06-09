@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Speculative Decoding Demo</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --border: #e3e6ea;
+    --ink: #1f2329;
+    --muted: #8b929c;
+    --baseline: #6b7280;
+    --dflash: #2563eb;
+    --ddtree: #059669;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 24px 20px 48px; }
+
+  .prompt-box {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  }
+  .prompt-box label { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .prompt-row { display: flex; gap: 10px; margin-top: 8px; }
+  textarea#prompt {
+    flex: 1;
+    resize: vertical;
+    min-height: 52px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: inherit;
+    color: var(--ink);
+    outline: none;
+  }
+  textarea#prompt:focus { border-color: var(--dflash); }
+  button#run {
+    align-self: stretch;
+    border: none;
+    border-radius: 8px;
+    background: var(--ink);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 0 22px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button#run:disabled { opacity: .5; cursor: default; }
+  .opts { display: flex; gap: 18px; margin-top: 10px; font-size: 12px; color: var(--muted); align-items: center; }
+  .opts input { width: 64px; border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; font-size: 12px; }
+
+  .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 20px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px 16px;
+    display: flex;
+    flex-direction: column;
+    min-height: 420px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  }
+  .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+  .title { font-size: 15px; font-weight: 700; }
+  .subtitle { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .tps-badge {
+    font-size: 12px; font-weight: 700; color: #fff;
+    border-radius: 999px; padding: 4px 11px; white-space: nowrap;
+    background: var(--baseline);
+  }
+  .card[data-method="dflash"] .tps-badge { background: var(--dflash); }
+  .card[data-method="ddtree"] .tps-badge { background: var(--ddtree); }
+  .card[data-method="dflash"] .title { color: var(--dflash); }
+  .card[data-method="ddtree"] .title { color: var(--ddtree); }
+
+  .meter { height: 4px; background: var(--border); border-radius: 4px; margin: 12px 0 8px; overflow: hidden; }
+  .meter > span { display: block; height: 100%; width: 0%; transition: width .15s linear; background: var(--baseline); }
+  .card[data-method="dflash"] .meter > span { background: var(--dflash); }
+  .card[data-method="ddtree"] .meter > span { background: var(--ddtree); }
+
+  .stats { font-size: 11px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 8px; }
+  .stats b { color: var(--ink); font-weight: 600; }
+
+  /* Small font on purpose so the speed difference is visible. */
+  .output {
+    flex: 1;
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-y: auto;
+    color: #2b2f36;
+    max-height: 360px;
+  }
+  .output .caret { display: inline-block; width: 6px; height: 12px; background: currentColor; opacity: .6; animation: blink 1s steps(2) infinite; vertical-align: -1px; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .err { color: #dc2626; font-size: 11px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="prompt-box">
+    <label for="prompt">Prompt</label>
+    <div class="prompt-row">
+      <textarea id="prompt" placeholder="Write a concise explanation of speculative decoding and why tree verification can improve throughput.">Write a concise explanation of speculative decoding and why tree verification can improve throughput.</textarea>
+      <button id="run">Run</button>
+    </div>
+    <div class="opts">
+      <span>max new tokens <input id="maxtok" type="number" min="16" max="4096" /></span>
+      <span>temperature <input id="temp" type="number" min="0" max="2" step="0.1" /></span>
+    </div>
+  </div>
+
+  <div class="cols" id="cols"></div>
+</div>
+
+<script>
+const COLORS = { baseline: "#6b7280", dflash: "#2563eb", ddtree: "#059669" };
+let CONFIG = null;
+let es = null;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+async function init() {
+  CONFIG = await (await fetch("/config")).json();
+  document.getElementById("maxtok").value = CONFIG.default_max_new_tokens;
+  document.getElementById("temp").value = CONFIG.default_temperature;
+
+  const cols = document.getElementById("cols");
+  cols.innerHTML = "";
+  for (const m of CONFIG.methods) {
+    const card = el("div", "card");
+    card.dataset.method = m.key;
+
+    const head = el("div", "card-head");
+    const left = el("div");
+    left.appendChild(el("div", "title", m.title));
+    left.appendChild(el("div", "subtitle", m.subtitle));
+    const badge = el("div", "tps-badge", "0 tok/s");
+    badge.dataset.role = "tps";
+    head.appendChild(left);
+    head.appendChild(badge);
+
+    const meter = el("div", "meter");
+    meter.appendChild(el("span"));
+
+    const stats = el("div", "stats");
+    const tokSpan = el("span"); tokSpan.innerHTML = "tokens <b data-role='tokens'>0</b>";
+    stats.appendChild(tokSpan);
+    if (m.key !== "baseline") {
+      const accSpan = el("span"); accSpan.innerHTML = "accept len <b data-role='acc'>–</b>";
+      stats.appendChild(accSpan);
+    }
+    const ttftSpan = el("span"); ttftSpan.innerHTML = "TTFT <b data-role='ttft'>–</b>";
+    stats.appendChild(ttftSpan);
+
+    const out = el("div", "output");
+    out.dataset.role = "out";
+
+    card.appendChild(head);
+    card.appendChild(meter);
+    card.appendChild(stats);
+    card.appendChild(out);
+    cols.appendChild(card);
+  }
+}
+
+function q(method, role) {
+  return document.querySelector(`.card[data-method="${method}"] [data-role="${role}"]`);
+}
+
+function resetColumns() {
+  for (const m of CONFIG.methods) {
+    q(m.key, "tps").textContent = "0 tok/s";
+    q(m.key, "tokens").textContent = "0";
+    const acc = q(m.key, "acc"); if (acc) acc.textContent = "–";
+    q(m.key, "ttft").textContent = "–";
+    const out = q(m.key, "out");
+    out.textContent = "";
+    out.classList.remove("err");
+    const caret = el("span", "caret");
+    out.appendChild(caret);
+    out._caret = caret;
+    const meter = document.querySelector(`.card[data-method="${m.key}"] .meter > span`);
+    meter.style.width = "0%";
+  }
+}
+
+function run() {
+  const prompt = document.getElementById("prompt").value.trim();
+  if (!prompt) return;
+  if (es) es.close();
+
+  const maxtok = document.getElementById("maxtok").value;
+  const temp = document.getElementById("temp").value;
+  const btn = document.getElementById("run");
+  btn.disabled = true;
+
+  resetColumns();
+  const maxtokNum = parseInt(maxtok, 10) || CONFIG.default_max_new_tokens;
+  let finished = 0;
+
+  const url = `/stream?prompt=${encodeURIComponent(prompt)}&max_new_tokens=${maxtok}&temperature=${temp}`;
+  es = new EventSource(url);
+
+  es.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if (d.event === "token") {
+      const out = q(d.method, "out");
+      const caret = out._caret;
+      caret.insertAdjacentText("beforebegin", d.delta);
+      out.scrollTop = out.scrollHeight;
+      q(d.method, "tps").textContent = `${d.tps} tok/s`;
+      q(d.method, "tokens").textContent = d.tokens;
+      const acc = q(d.method, "acc"); if (acc) acc.textContent = d.acc.toFixed(2);
+      const meter = document.querySelector(`.card[data-method="${d.method}"] .meter > span`);
+      meter.style.width = Math.min(100, (d.tokens / maxtokNum) * 100) + "%";
+    } else if (d.event === "done") {
+      const out = q(d.method, "out");
+      out.textContent = d.text;          // authoritative final text
+      q(d.method, "tps").textContent = `${d.tps} tok/s`;
+      q(d.method, "tokens").textContent = d.tokens;
+      const acc = q(d.method, "acc"); if (acc) acc.textContent = d.acc.toFixed(2);
+      q(d.method, "ttft").textContent = `${d.ttft} ms`;
+      const meter = document.querySelector(`.card[data-method="${d.method}"] .meter > span`);
+      meter.style.width = "100%";
+      if (++finished >= CONFIG.methods.length) { es.close(); btn.disabled = false; }
+    } else if (d.event === "error") {
+      const out = q(d.method, "out");
+      out.classList.add("err");
+      out.textContent = "Error:\n" + d.error;
+      if (++finished >= CONFIG.methods.length) { es.close(); btn.disabled = false; }
+    }
+  };
+
+  es.onerror = () => {
+    // Stream closed (normally after the final done). Re-enable the button.
+    btn.disabled = false;
+    if (es) es.close();
+  };
+}
+
+document.getElementById("run").addEventListener("click", run);
+document.getElementById("prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) run();
+});
+init();
+</script>
+</body>
+</html>

@@ -713,6 +713,7 @@ def ddtree_generate(
     debug_expected_output_ids: torch.Tensor | None = None,
     debug_label: str = "",
     debug_mismatch_log_limit: int | None = 8,
+    on_commit=None,
 ) -> SimpleNamespace:
     if block_size <= 1:
         return dflash_generate(
@@ -727,6 +728,7 @@ def ddtree_generate(
             debug_expected_output_ids=debug_expected_output_ids,
             debug_label=debug_label,
             debug_mismatch_log_limit=debug_mismatch_log_limit,
+            on_commit=on_commit,
         )
 
     num_input_tokens = input_ids.shape[1]
@@ -1075,6 +1077,10 @@ def ddtree_generate(
 
         output_ids[:, start : start + len(accepted_indices)] = accepted_tokens
         output_ids[:, start + len(accepted_indices)] = next_token
+
+        if on_commit is not None:
+            committed = output_ids[0, start : start + len(accepted_indices)].tolist()
+            on_commit([int(token_id) for token_id in committed], len(accepted_indices))
 
         acceptance_lengths.append(len(accepted_indices))
         start += len(accepted_indices)

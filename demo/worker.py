@@ -1,0 +1,227 @@
+"""GPU worker process for the speculative-decoding demo.
+
+Each worker owns ONE GPU and ONE decoding algorithm. It loads the target model
+(and the DFlash draft when needed) once, then serves generation requests off an
+input queue, streaming committed tokens back over a shared output queue as they
+are produced. CUDA_VISIBLE_DEVICES is pinned per-process so the three workers run
+truly concurrently on three different GPUs.
+"""
+
+import os
+import sys
+import traceback
+
+# Make the repo root importable regardless of how we are launched (spawn re-imports).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+
+def _has_flash_attn() -> bool:
+    try:
+        import flash_attn  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _get_stop_token_ids(tokenizer, target) -> list:
+    """Same stop-token logic the benchmark uses (inlined to avoid heavy imports)."""
+    stop_token_ids = []
+    for source in (
+        getattr(target, "generation_config", None),
+        getattr(target, "config", None),
+        getattr(getattr(target, "config", None), "text_config", None),
+    ):
+        eos_token_id = getattr(source, "eos_token_id", None)
+        if eos_token_id is None:
+            continue
+        if isinstance(eos_token_id, int):
+            stop_token_ids.append(eos_token_id)
+        else:
+            stop_token_ids.extend(int(token_id) for token_id in eos_token_id)
+    if tokenizer.eos_token_id is not None:
+        stop_token_ids.append(int(tokenizer.eos_token_id))
+    return sorted(set(stop_token_ids))
+
+
+def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q, ready_q):
+    """Entry point for a worker subprocess.
+
+    method:    one of "baseline", "dflash", "ddtree".
+    gpu_id:    physical GPU id this worker pins to (becomes cuda:0 inside the process).
+    in_q:      requests come in as dicts {req, prompt, max_new_tokens, temperature}.
+    out_q:     shared queue; we push {type, method, req, ...} events.
+    ready_q:   we push our method name once models are loaded + warmed up.
+    """
+    # Must be set before any CUDA context is created.
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from model import DFlashDraftModel
+        from eagle3 import target_generate
+        from dflash import dflash_generate
+        from ddtree import ddtree_generate, maybe_enable_cpp_compact
+
+        torch.manual_seed(0)
+        torch.cuda.set_device(0)
+        device = torch.device("cuda:0")
+
+        # The target verifier always runs with sdpa: DDTree applies a custom tree
+        # attention mask that is incompatible with FlashAttention. Using sdpa for
+        # all three keeps the comparison fair.
+        target = (
+            AutoModelForCausalLM.from_pretrained(
+                model_path, attn_implementation="sdpa", dtype=torch.bfloat16
+            )
+            .to(device)
+            .eval()
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        stop_token_ids = _get_stop_token_ids(tokenizer, target)
+
+        draft = None
+        block_size = None
+        if method in ("dflash", "ddtree"):
+            draft_attn = "flash_attention_2" if _has_flash_attn() else "sdpa"
+            try:
+                draft = (
+                    DFlashDraftModel.from_pretrained(
+                        draft_path, attn_implementation=draft_attn, dtype=torch.bfloat16
+                    )
+                    .to(device)
+                    .eval()
+                )
+            except Exception:
+                # Fall back to sdpa if the draft cannot use FlashAttention here.
+                draft = (
+                    DFlashDraftModel.from_pretrained(
+                        draft_path, attn_implementation="sdpa", dtype=torch.bfloat16
+                    )
+                    .to(device)
+                    .eval()
+                )
+            if hasattr(draft, "configure_for_target"):
+                draft.configure_for_target(target)
+            block_size = draft.block_size
+
+        if method == "ddtree":
+            maybe_enable_cpp_compact(True)
+
+        def build_input_ids(prompt: str):
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                # Tokenizer's chat template doesn't take enable_thinking.
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            return tokenizer.encode(text, return_tensors="pt").to(device)
+
+        def run(input_ids, max_new_tokens, temperature, on_commit):
+            if method == "baseline":
+                return target_generate(
+                    target=target,
+                    input_ids=input_ids,
+                    max_new_tokens=max_new_tokens,
+                    stop_token_ids=stop_token_ids,
+                    temperature=temperature,
+                    on_commit=on_commit,
+                )
+            if method == "dflash":
+                return dflash_generate(
+                    model=draft,
+                    target=target,
+                    input_ids=input_ids,
+                    mask_token_id=draft.mask_token_id,
+                    max_new_tokens=max_new_tokens,
+                    block_size=block_size,
+                    stop_token_ids=stop_token_ids,
+                    temperature=temperature,
+                    debug_mismatch_log_limit=0,
+                    on_commit=on_commit,
+                )
+            return ddtree_generate(
+                model=draft,
+                target=target,
+                input_ids=input_ids,
+                mask_token_id=draft.mask_token_id,
+                max_new_tokens=max_new_tokens,
+                block_size=block_size,
+                tree_budget=tree_budget,
+                stop_token_ids=stop_token_ids,
+                temperature=temperature,
+                debug_mismatch_log_limit=0,
+                on_commit=on_commit,
+            )
+
+        # Warm up CUDA kernels / caches so the first real request is not penalised.
+        warmup_ids = build_input_ids("Hello")
+        run(warmup_ids, 8, 0.0, None)
+
+        ready_q.put(method)
+
+    except Exception:
+        ready_q.put({"error": traceback.format_exc(), "method": method})
+        return
+
+    # Serve requests until told to stop.
+    while True:
+        req = in_q.get()
+        if req is None:
+            break
+        req_id = req["req"]
+        try:
+            input_ids = build_input_ids(req["prompt"])
+
+            def on_commit(ids, acc, _req_id=req_id):
+                out_q.put(
+                    {"type": "token", "method": method, "req": _req_id, "ids": ids, "acc": acc}
+                )
+
+            response = run(
+                input_ids,
+                int(req["max_new_tokens"]),
+                float(req["temperature"]),
+                on_commit,
+            )
+
+            generated_ids = response.output_ids[0, response.num_input_tokens :].tolist()
+            full_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            tpot = response.time_per_output_token
+            tps = (1.0 / tpot) if tpot and tpot > 0 else 0.0
+            acc_lengths = response.acceptance_lengths or [1]
+            mean_acc = sum(acc_lengths) / len(acc_lengths)
+            out_q.put(
+                {
+                    "type": "done",
+                    "method": method,
+                    "req": req_id,
+                    "text": full_text,
+                    "tps": tps,
+                    "acc": mean_acc,
+                    "num_tokens": int(response.num_output_tokens),
+                    "ttft": float(response.time_to_first_token),
+                    "rounds": int(response.decode_rounds),
+                }
+            )
+        except Exception:
+            out_q.put(
+                {
+                    "type": "error",
+                    "method": method,
+                    "req": req_id,
+                    "error": traceback.format_exc(),
+                }
+            )

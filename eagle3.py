@@ -86,6 +86,7 @@ def target_generate(
     max_new_tokens: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    on_commit=None,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -106,6 +107,8 @@ def target_generate(
     next_token = sample(output.logits, temperature).to(target.device)
     output_ids = torch.cat([input_ids, next_token], dim=1)
     time_to_first_token = cuda_time() - prefill_start
+    if on_commit is not None:
+        on_commit([int(next_token[0, 0].item())], 1)
 
     decode_start = cuda_time()
     round_clock_start = cuda_time()
@@ -128,6 +131,8 @@ def target_generate(
         output_ids = torch.cat([output_ids, next_token], dim=1)
         stage_times["decode"] += cuda_time() - decode_stage_start
         round_timestamps.append(cuda_time() - round_clock_start)
+        if on_commit is not None:
+            on_commit([int(next_token[0, 0].item())], 1)
         if stop_token_ids_tensor is not None and torch.isin(next_token[0], stop_token_ids_tensor).any():
             break
 

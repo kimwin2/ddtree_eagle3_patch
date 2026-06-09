@@ -38,6 +38,7 @@ def dflash_generate(
     debug_expected_output_ids: torch.Tensor | None = None,
     debug_label: str = "",
     debug_mismatch_log_limit: int | None = 8,
+    on_commit=None,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -173,6 +174,10 @@ def dflash_generate(
                         )
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+
+        if on_commit is not None:
+            committed = output_ids[0, start : start + acceptance_length + 1].tolist()
+            on_commit([int(token_id) for token_id in committed], acceptance_length + 1)
 
         acceptance_lengths.append(acceptance_length + 1)
         start += acceptance_length + 1
