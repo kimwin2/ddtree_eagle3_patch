@@ -93,6 +93,11 @@
 
   .stats { font-size: 11px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 8px; }
   .stats b { color: var(--ink); font-weight: 600; }
+  .mem { font-size: 11px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 10px; }
+  .mem b { color: var(--ink); font-weight: 600; }
+  .mem .draft { color: var(--baseline); }
+  .card[data-method="dflash"] .mem .draft { color: var(--dflash); }
+  .card[data-method="ddtree"] .mem .draft { color: var(--ddtree); }
 
   /* Small font on purpose so the speed difference is visible. */
   .output {
@@ -139,6 +144,13 @@ function el(tag, cls, text) {
   return e;
 }
 
+function fmtBytes(n) {
+  if (!n || n <= 0) return "–";
+  const gb = n / 1073741824;
+  if (gb >= 1) return gb.toFixed(2) + " GB";
+  return (n / 1048576).toFixed(0) + " MB";
+}
+
 async function init() {
   CONFIG = await (await fetch("/config")).json();
   document.getElementById("maxtok").value = CONFIG.default_max_new_tokens;
@@ -171,12 +183,27 @@ async function init() {
     const ttftSpan = el("span"); ttftSpan.innerHTML = "TTFT <b data-role='ttft'>–</b>";
     stats.appendChild(ttftSpan);
 
+    // Memory footprint: ROM is the static weight memory (target, shared across all
+    // columns; the draft adds to it). RAM is the live activation/KV peak for the
+    // current request.
+    const mem = el("div", "mem");
+    const romSpan = el("span");
+    let romHtml = `ROM <b>${fmtBytes(m.target_rom_bytes)}</b>`;
+    if (m.draft_rom_bytes > 0) {
+      romHtml += ` <span class="draft">+ draft <b>${fmtBytes(m.draft_rom_bytes)}</b></span>`;
+    }
+    romSpan.innerHTML = romHtml;
+    const ramSpan = el("span"); ramSpan.innerHTML = "RAM <b data-role='ram'>–</b>";
+    mem.appendChild(romSpan);
+    mem.appendChild(ramSpan);
+
     const out = el("div", "output");
     out.dataset.role = "out";
 
     card.appendChild(head);
     card.appendChild(meter);
     card.appendChild(stats);
+    card.appendChild(mem);
     card.appendChild(out);
     cols.appendChild(card);
   }
@@ -192,6 +219,7 @@ function resetColumns() {
     q(m.key, "tokens").textContent = "0";
     const acc = q(m.key, "acc"); if (acc) acc.textContent = "–";
     q(m.key, "ttft").textContent = "–";
+    q(m.key, "ram").textContent = "–";
     const out = q(m.key, "out");
     out.textContent = "";
     out.classList.remove("err");
@@ -230,6 +258,7 @@ function run() {
       q(d.method, "tps").textContent = `${d.tps} tok/s`;
       q(d.method, "tokens").textContent = d.tokens;
       const acc = q(d.method, "acc"); if (acc) acc.textContent = d.acc.toFixed(2);
+      if (d.ram_bytes) q(d.method, "ram").textContent = fmtBytes(d.ram_bytes);
       const meter = document.querySelector(`.card[data-method="${d.method}"] .meter > span`);
       meter.style.width = Math.min(100, (d.tokens / maxtokNum) * 100) + "%";
     } else if (d.event === "done") {
@@ -238,6 +267,7 @@ function run() {
       q(d.method, "tokens").textContent = d.tokens;
       const acc = q(d.method, "acc"); if (acc) acc.textContent = d.acc.toFixed(2);
       q(d.method, "ttft").textContent = `${d.ttft} ms`;
+      if (d.ram_bytes) q(d.method, "ram").textContent = fmtBytes(d.ram_bytes) + " peak";
       const meter = document.querySelector(`.card[data-method="${d.method}"] .meter > span`);
       meter.style.width = "100%";
     } else if (d.event === "error") {

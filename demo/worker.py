@@ -26,6 +26,21 @@ def _has_flash_attn() -> bool:
         return False
 
 
+def _model_bytes(module) -> int:
+    """Static weight footprint of a model: parameters + buffers, in bytes.
+
+    This is the "ROM" figure — the model's parameters turned into memory. We use
+    parameter accounting rather than torch.cuda.memory_allocated() so the number
+    is exact and independent of allocator padding, and so a low-bit / quantized
+    draft honestly reports its smaller footprint.
+    """
+    if module is None:
+        return 0
+    total = sum(p.numel() * p.element_size() for p in module.parameters())
+    total += sum(b.numel() * b.element_size() for b in module.buffers())
+    return int(total)
+
+
 # Top-level stage keys per method (what sums to the decode time) plus, for
 # ddtree, the sub-breakdown of tree_build. The sub keys are NOT added to the
 # total — they decompose tree_build, so summing them again would double-count.
@@ -202,11 +217,22 @@ def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q
                 on_commit=on_commit,
             )
 
+        # Static weight footprint ("ROM"). The target is identical across all
+        # three methods (shared); only the draft adds to it.
+        target_rom_bytes = _model_bytes(target)
+        draft_rom_bytes = _model_bytes(draft)
+
         # Warm up CUDA kernels / caches so the first real request is not penalised.
         warmup_ids = build_input_ids("Hello")
         run(warmup_ids, 8, 0.0, None)
 
-        ready_q.put(method)
+        ready_q.put(
+            {
+                "method": method,
+                "target_rom_bytes": target_rom_bytes,
+                "draft_rom_bytes": draft_rom_bytes,
+            }
+        )
 
     except Exception:
         ready_q.put({"error": traceback.format_exc(), "method": method})
@@ -221,9 +247,25 @@ def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q
         try:
             input_ids = build_input_ids(req["prompt"])
 
-            def on_commit(ids, acc, _req_id=req_id):
+            # Activation/KV "RAM" peak for this request: high-water mark of
+            # allocated memory above the at-rest (weights-only) level. We read the
+            # monotonic max_memory_allocated() rather than polling memory_allocated()
+            # because the true peak happens transiently inside a CUDA forward call
+            # and a Python poll would miss it.
+            rest_allocated = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+
+            def on_commit(ids, acc, _req_id=req_id, _rest=rest_allocated):
+                ram = max(int(torch.cuda.max_memory_allocated()) - _rest, 0)
                 out_q.put(
-                    {"type": "token", "method": method, "req": _req_id, "ids": ids, "acc": acc}
+                    {
+                        "type": "token",
+                        "method": method,
+                        "req": _req_id,
+                        "ids": ids,
+                        "acc": acc,
+                        "ram_bytes": ram,
+                    }
                 )
 
             response = run(
@@ -250,6 +292,7 @@ def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q
                 _format_stage_times(method, stage_times, int(response.decode_rounds), tps, mean_acc),
                 flush=True,
             )
+            ram_peak = max(int(torch.cuda.max_memory_allocated()) - rest_allocated, 0)
             out_q.put(
                 {
                     "type": "done",
@@ -262,6 +305,7 @@ def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q
                     "ttft": float(response.time_to_first_token),
                     "rounds": int(response.decode_rounds),
                     "stage_times": stage_times,
+                    "ram_bytes": ram_peak,
                 }
             )
         except Exception:

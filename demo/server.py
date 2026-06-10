@@ -73,9 +73,15 @@ def index():
 
 @app.get("/config")
 def config():
+    rom = CONFIG.get("rom", {})
     return {
         "methods": [
-            {"key": key, "title": CONFIG["titles"][key]}
+            {
+                "key": key,
+                "title": CONFIG["titles"][key],
+                "target_rom_bytes": rom.get(key, {}).get("target_rom_bytes", 0),
+                "draft_rom_bytes": rom.get(key, {}).get("draft_rom_bytes", 0),
+            }
             for key in METHODS
         ],
         "default_max_new_tokens": CONFIG["max_new_tokens"],
@@ -157,6 +163,7 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
                             "tps": round(live_tps, 1),
                             "acc": round(live_acc, 2),
                             "tokens": st["count"],
+                            "ram_bytes": event.get("ram_bytes", 0),
                         }
                     )
                 elif event["type"] == "done":
@@ -169,6 +176,7 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
                             "acc": round(event["acc"], 2),
                             "tokens": event["num_tokens"],
                             "ttft": round(event["ttft"] * 1000),
+                            "ram_bytes": event.get("ram_bytes", 0),
                         }
                     )
                 elif event["type"] == "error":
@@ -235,6 +243,7 @@ def main():
         },
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
+        "rom": {},  # method -> {target_rom_bytes, draft_rom_bytes}, filled as workers report ready.
     }
 
     # Server-side tokenizer for incremental decoding (CPU only, no GPU needed).
@@ -274,6 +283,10 @@ def main():
         msg = ready_q.get()
         if isinstance(msg, dict) and msg.get("error"):
             raise SystemExit(f"[demo] worker '{msg.get('method')}' failed to start:\n{msg['error']}")
+        CONFIG["rom"][msg["method"]] = {
+            "target_rom_bytes": int(msg.get("target_rom_bytes", 0)),
+            "draft_rom_bytes": int(msg.get("draft_rom_bytes", 0)),
+        }
         print(f"[demo] worker ready: {msg}", flush=True)
         ready += 1
 
