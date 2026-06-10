@@ -26,6 +26,42 @@ def _has_flash_attn() -> bool:
         return False
 
 
+# Top-level stage keys per method (what sums to the decode time) plus, for
+# ddtree, the sub-breakdown of tree_build. The sub keys are NOT added to the
+# total — they decompose tree_build, so summing them again would double-count.
+_STAGE_LAYOUT = {
+    "baseline": (("decode",), {}),
+    "dflash": (("draft", "verify", "commit"), {}),
+    "ddtree": (
+        ("draft", "tree_build", "tree_compile", "verify", "commit"),
+        {"tree_build": ("tree_build_copy", "tree_build_heap", "tree_build_visibility")},
+    ),
+}
+
+
+def _format_stage_times(method, stage_times, rounds, tps, mean_acc) -> str:
+    """Render a readable per-stage decode-time breakdown for one request."""
+    top_keys, sub = _STAGE_LAYOUT.get(method, (tuple(stage_times.keys()), {}))
+    total = sum(float(stage_times.get(key, 0.0)) for key in top_keys)
+    lines = [
+        f"[stage_times] method={method} rounds={rounds} "
+        f"decode={total:.3f}s tps={tps:.1f} acc={mean_acc:.2f}"
+    ]
+    for key in top_keys:
+        elapsed = float(stage_times.get(key, 0.0))
+        pct = (100.0 * elapsed / total) if total > 0 else 0.0
+        line = f"    {key:<13s}: {elapsed:.4f}s ({pct:5.1f}%)"
+        sub_keys = sub.get(key)
+        if sub_keys:
+            detail = "  ".join(
+                f"{sub_key.replace('tree_build_', '')} {float(stage_times.get(sub_key, 0.0)):.4f}"
+                for sub_key in sub_keys
+            )
+            line += f"   [{detail}]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _get_stop_token_ids(tokenizer, target) -> list:
     """Same stop-token logic the benchmark uses (inlined to avoid heavy imports)."""
     stop_token_ids = []
@@ -203,6 +239,17 @@ def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q
             tps = (1.0 / tpot) if tpot and tpot > 0 else 0.0
             acc_lengths = response.acceptance_lengths or [1]
             mean_acc = sum(acc_lengths) / len(acc_lengths)
+            stage_times = {
+                key: float(value)
+                for key, value in (getattr(response, "stage_times", None) or {}).items()
+            }
+            # Print a per-stage decode-time breakdown so we can see, e.g., whether
+            # ddtree's round is dominated by target verify or by the tree_build /
+            # commit (cache-compaction) CPU work — the key question on small models.
+            print(
+                _format_stage_times(method, stage_times, int(response.decode_rounds), tps, mean_acc),
+                flush=True,
+            )
             out_q.put(
                 {
                     "type": "done",
@@ -214,6 +261,7 @@ def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q
                     "num_tokens": int(response.num_output_tokens),
                     "ttft": float(response.time_to_first_token),
                     "rounds": int(response.decode_rounds),
+                    "stage_times": stage_times,
                 }
             )
         except Exception:
