@@ -3,8 +3,8 @@
 Each worker owns ONE GPU and ONE decoding algorithm. It loads the target model
 (and the DFlash draft when needed) once, then serves generation requests off an
 input queue, streaming committed tokens back over a shared output queue as they
-are produced. CUDA_VISIBLE_DEVICES is pinned per-process so the three workers run
-truly concurrently on three different GPUs.
+are produced. CUDA_VISIBLE_DEVICES is pinned per-process so the workers run
+truly concurrently on separate GPUs.
 """
 
 import os
@@ -48,6 +48,11 @@ _STAGE_LAYOUT = {
     "baseline": (("decode",), {}),
     "dflash": (("draft", "verify", "commit"), {}),
     "ddtree": (
+        ("draft", "tree_build", "tree_compile", "verify", "commit"),
+        {"tree_build": ("tree_build_copy", "tree_build_heap", "tree_build_visibility")},
+    ),
+    # littlebit is the ddtree algorithm with a LittleBit-quantized draft; same stages.
+    "littlebit": (
         ("draft", "tree_build", "tree_compile", "verify", "commit"),
         {"tree_build": ("tree_build_copy", "tree_build_heap", "tree_build_visibility")},
     ),
@@ -97,14 +102,27 @@ def _get_stop_token_ids(tokenizer, target) -> list:
     return sorted(set(stop_token_ids))
 
 
-def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q, ready_q):
+def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q, ready_q,
+                draft_type="dflash", quant_mod="LittleBitOnDeviceLinearPerChannel",
+                quant_func="STEBinary", eff_bit=1.0, kv_factor=2.0,
+                min_split_dim=8, group_size=64, residual=False):
     """Entry point for a worker subprocess.
 
-    method:    one of "baseline", "dflash", "ddtree".
+    method:    one of "baseline", "dflash", "ddtree", "littlebit". "littlebit" runs
+               the ddtree algorithm with a LittleBit-quantized draft (draft_type
+               "littlebit_dflash").
     gpu_id:    physical GPU id this worker pins to (becomes cuda:0 inside the process).
     in_q:      requests come in as dicts {req, prompt, max_new_tokens, temperature}.
     out_q:     shared queue; we push {type, method, req, ...} events.
     ready_q:   we push our method name once models are loaded + warmed up.
+    draft_type: "dflash" or "littlebit_dflash".
+    quant_mod:  LittleBit quantization module name.
+    quant_func: LittleBit quantization function name.
+    eff_bit:    effective bit width for quantization.
+    kv_factor:  KV cache factor.
+    min_split_dim: minimum split dimension.
+    group_size: quantization group size.
+    residual:   whether to use residual quantization.
     """
     # Must be set before any CUDA context is created.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -128,40 +146,57 @@ def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q
         # all three keeps the comparison fair.
         target = (
             AutoModelForCausalLM.from_pretrained(
-                model_path, attn_implementation="sdpa", dtype=torch.bfloat16
+                # model_path, attn_implementation="sdpa", dtype=torch.bfloat16,
+                model_path, attn_implementation="sdpa", dtype=torch.float32,
+                trust_remote_code=True,
             )
             .to(device)
             .eval()
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         stop_token_ids = _get_stop_token_ids(tokenizer, target)
 
         draft = None
         block_size = None
-        if method in ("dflash", "ddtree"):
-            draft_attn = "flash_attention_2" if _has_flash_attn() else "sdpa"
-            try:
-                draft = (
-                    DFlashDraftModel.from_pretrained(
-                        draft_path, attn_implementation=draft_attn, dtype=torch.bfloat16
-                    )
-                    .to(device)
-                    .eval()
+        if method in ("dflash", "ddtree", "littlebit"):
+            draft_attn = "sdpa"
+            if draft_type == "littlebit_dflash":
+                from littlebit import load_quantized_dflash_model
+                draft = load_quantized_dflash_model(
+                    draft_path,
+                    device=device,
+                    # torch_dtype=torch.bfloat16,
+                    torch_dtype=torch.float32,
+                    quant_args=None,  # auto-detect from checkpoint's littlebit_config.json
+                    attn_implementation=draft_attn,
                 )
-            except Exception:
-                # Fall back to sdpa if the draft cannot use FlashAttention here.
-                draft = (
-                    DFlashDraftModel.from_pretrained(
-                        draft_path, attn_implementation="sdpa", dtype=torch.bfloat16
+            else:
+                try:
+                    draft = (
+                        DFlashDraftModel.from_pretrained(
+                            # draft_path, attn_implementation=draft_attn, dtype=torch.bfloat16,
+                            draft_path, attn_implementation=draft_attn, dtype=torch.bfloat32,
+                            trust_remote_code=True,
+                        )
+                        .to(device)
+                        .eval()
                     )
-                    .to(device)
-                    .eval()
-                )
+                except Exception:
+                    # Fall back to sdpa if the draft cannot use FlashAttention here.
+                    draft = (
+                        DFlashDraftModel.from_pretrained(
+                            # draft_path, attn_implementation="sdpa", dtype=torch.bfloat16,
+                            draft_path, attn_implementation="sdpa", dtype=torch.float32,
+                            trust_remote_code=True,
+                        )
+                        .to(device)
+                        .eval()
+                    )
             if hasattr(draft, "configure_for_target"):
                 draft.configure_for_target(target)
             block_size = draft.block_size
 
-        if method == "ddtree":
+        if method in ("ddtree", "littlebit"):
             maybe_enable_cpp_compact(True)
 
         def build_input_ids(prompt: str):

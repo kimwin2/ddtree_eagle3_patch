@@ -1,16 +1,19 @@
-"""Web demo: three decoding algorithms streaming side by side.
+"""Web demo: four decoding algorithms streaming side by side.
 
 Spawns one GPU worker per algorithm (baseline autoregressive, DFlash, DFlash +
-DDTree), each pinned to its own GPU, and streams committed tokens to the browser
-in real time over Server-Sent Events. The page shows the live text, a live
-tokens-per-second counter for all three, and the average acceptance length for
-the two speculative methods.
+DDTree, and DFlash + DDTree with a LittleBit-quantized draft), each pinned to its
+own GPU, and streams committed tokens to the browser in real time over
+Server-Sent Events. The page shows the live text, a live tokens-per-second
+counter for all four, and the average acceptance length for the speculative
+methods.
 
 Run:
     python -m demo.server \
         --model-name-or-path Qwen/Qwen3-8B \
         --draft-name-or-path z-lab/Qwen3-8B-DFlash-b16 \
-        --gpus 0,1,2 \
+        --littlebit-model-name-or-path Qwen/Qwen3-8B-rotated \
+        --littlebit-draft-name-or-path z-lab/Qwen3-8B-DFlash-LittleBit \
+        --gpus 0,1,2,3 \
         --model-label "Gauss 4.0"
 """
 
@@ -36,7 +39,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from demo.worker import worker_main
 
 
-METHODS = ["baseline", "dflash", "ddtree"]
+METHODS = ["baseline", "dflash", "ddtree", "littlebit"]
 
 # Filled in by main().
 CONFIG = {}
@@ -205,11 +208,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-name-or-path", type=str, default="Qwen/Qwen3-8B")
     parser.add_argument("--draft-name-or-path", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
+    # The 4th (LittleBit) column uses its own target + quantized draft. They default
+    # to the standard model/draft when not given.
+    parser.add_argument("--littlebit-model-name-or-path", type=str, default=None,
+                        help="Target model for the LittleBit column (defaults to --model-name-or-path).")
+    parser.add_argument("--littlebit-draft-name-or-path", type=str, default=None,
+                        help="LittleBit-quantized draft checkpoint for the LittleBit column.")
     parser.add_argument(
         "--gpus",
         type=str,
-        default="0,1,2",
-        help="Comma-separated physical GPU ids for baseline,dflash,ddtree (in that order).",
+        default="0,1,2,3",
+        help="Comma-separated physical GPU ids for baseline,dflash,ddtree,littlebit (in that order).",
     )
     parser.add_argument(
         "--model-label",
@@ -222,6 +231,15 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    # LittleBit quantization args
+    parser.add_argument("--draft-type", type=str, default="dflash", choices=["dflash", "littlebit_dflash"])
+    parser.add_argument("--quant-mod", type=str, default="LittleBitOnDeviceLinearPerChannel")
+    parser.add_argument("--quant-func", type=str, default="STEBinary")
+    parser.add_argument("--eff-bit", type=float, default=1.0)
+    parser.add_argument("--kv-factor", type=float, default=2.0)
+    parser.add_argument("--min-split-dim", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument("--residual", action="store_true")
     return parser.parse_args()
 
 
@@ -240,16 +258,28 @@ def main():
             "baseline": model_label,
             "dflash": f"{model_label} + DFlash",
             "ddtree": f"{model_label} + DFlash + DDTree",
+            "littlebit": f"{model_label} + DFlash + DDTree + LittleBit",
         },
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
         "rom": {},  # method -> {target_rom_bytes, draft_rom_bytes}, filled as workers report ready.
     }
 
+    # Per-method (target, draft, draft_type). The first three columns share the
+    # standard target + bf16/f32 draft; the LittleBit column uses its own rotated
+    # target and the quantized draft, loaded via the littlebit path.
+    lb_model = args.littlebit_model_name_or_path or args.model_name_or_path
+    lb_draft = args.littlebit_draft_name_or_path or args.draft_name_or_path
+    specs = {
+        method: (args.model_name_or_path, args.draft_name_or_path, args.draft_type)
+        for method in METHODS
+    }
+    specs["littlebit"] = (lb_model, lb_draft, "littlebit_dflash")
+
     # Server-side tokenizer for incremental decoding (CPU only, no GPU needed).
     from transformers import AutoTokenizer
 
-    TOKENIZER = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    TOKENIZER = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
     ctx = mp.get_context("spawn")
     OUT_Q = ctx.Queue()
@@ -257,6 +287,7 @@ def main():
 
     procs = []
     for method, gpu in zip(METHODS, gpus):
+        model_path, draft_path, draft_type = specs[method]
         in_q = ctx.Queue()
         IN_QUEUES[method] = in_q
         proc = ctx.Process(
@@ -264,18 +295,30 @@ def main():
             args=(
                 method,
                 gpu,
-                args.model_name_or_path,
-                args.draft_name_or_path,
+                model_path,
+                draft_path,
                 args.tree_budget,
                 in_q,
                 OUT_Q,
                 ready_q,
+                draft_type,
+                args.quant_mod,
+                args.quant_func,
+                args.eff_bit,
+                args.kv_factor,
+                args.min_split_dim,
+                args.group_size,
+                args.residual,
             ),
             daemon=True,
         )
         proc.start()
         procs.append(proc)
-        print(f"[demo] launched worker method={method} on GPU {gpu} (pid={proc.pid})", flush=True)
+        print(
+            f"[demo] launched worker method={method} on GPU {gpu} "
+            f"(pid={proc.pid}, draft_type={draft_type})",
+            flush=True,
+        )
 
     # Wait for all workers to finish loading + warming up.
     ready = 0

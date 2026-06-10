@@ -14,6 +14,7 @@
     --baseline: #6b7280;
     --dflash: #2563eb;
     --ddtree: #059669;
+    --littlebit: #d97706;
   }
   * { box-sizing: border-box; }
   body {
@@ -62,7 +63,7 @@
   .opts { display: flex; gap: 18px; margin-top: 10px; font-size: 12px; color: var(--muted); align-items: center; }
   .opts input { width: 64px; border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; font-size: 12px; }
 
-  .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 20px; }
+  .cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 20px; }
   .card {
     background: var(--card);
     border: 1px solid var(--border);
@@ -83,13 +84,16 @@
   }
   .card[data-method="dflash"] .tps-badge { background: var(--dflash); }
   .card[data-method="ddtree"] .tps-badge { background: var(--ddtree); }
+  .card[data-method="littlebit"] .tps-badge { background: var(--littlebit); }
   .card[data-method="dflash"] .title { color: var(--dflash); }
   .card[data-method="ddtree"] .title { color: var(--ddtree); }
+  .card[data-method="littlebit"] .title { color: var(--littlebit); }
 
   .meter { height: 4px; background: var(--border); border-radius: 4px; margin: 12px 0 8px; overflow: hidden; }
   .meter > span { display: block; height: 100%; width: 0%; transition: width .15s linear; background: var(--baseline); }
   .card[data-method="dflash"] .meter > span { background: var(--dflash); }
   .card[data-method="ddtree"] .meter > span { background: var(--ddtree); }
+  .card[data-method="littlebit"] .meter > span { background: var(--littlebit); }
 
   .stats { font-size: 11px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 8px; }
   .stats b { color: var(--ink); font-weight: 600; }
@@ -98,6 +102,7 @@
   .mem .draft { color: var(--baseline); }
   .card[data-method="dflash"] .mem .draft { color: var(--dflash); }
   .card[data-method="ddtree"] .mem .draft { color: var(--ddtree); }
+  .card[data-method="littlebit"] .mem .draft { color: var(--littlebit); }
 
   /* Small font on purpose so the speed difference is visible. */
   .output {
@@ -133,7 +138,7 @@
 </div>
 
 <script>
-const COLORS = { baseline: "#6b7280", dflash: "#2563eb", ddtree: "#059669" };
+const COLORS = { baseline: "#6b7280", dflash: "#2563eb", ddtree: "#059669", littlebit: "#d97706" };
 let CONFIG = null;
 let es = null;
 

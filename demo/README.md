@@ -1,6 +1,6 @@
 # Speculative Decoding Demo
 
-A three-column live demo that streams the **same prompt** through three decoders at
+A four-column live demo that streams the **same prompt** through four decoders at
 once, each on its own GPU, so you can watch the throughput difference in real time:
 
 | Column | Algorithm | What it shows |
@@ -8,6 +8,7 @@ once, each on its own GPU, so you can watch the throughput difference in real ti
 | 1 | Autoregressive (baseline) | original target model, one token per step |
 | 2 | DFlash | block speculative decoding, draft + target |
 | 3 | DFlash + DDTree | tree verification on top of DFlash |
+| 4 | DFlash + DDTree + LittleBit | same as column 3 but with a LittleBit-quantized draft (its own rotated target) |
 
 All three stream characters as they are committed, with a live **tokens/sec**
 counter. Columns 2 and 3 also show the live **acceptance length**. The decoding
@@ -28,11 +29,12 @@ Each column also shows its memory footprint:
 
 - `worker.py` — one subprocess per algorithm, pinned to one GPU via
   `CUDA_VISIBLE_DEVICES`. Loads the target (and DFlash draft) once, then serves
-  generation requests, streaming committed tokens back through a callback.
-- `server.py` — FastAPI app. Spawns the three workers, fans each prompt out to all
+  generation requests, streaming committed tokens back through a callback. The
+  LittleBit column loads its draft via the `littlebit` path and its own target.
+- `server.py` — FastAPI app. Spawns the four workers, fans each prompt out to all
   of them, and streams merged token events to the browser over Server-Sent Events.
   Incremental detokenization happens server-side (CPU).
-- `index.html` — the UI (prompt box + three live columns).
+- `index.html` — the UI (prompt box + four live columns).
 
 The token streaming is enabled by an optional `on_commit` callback that was added
 to `target_generate` / `dflash_generate` / `ddtree_generate` (no behavior change
