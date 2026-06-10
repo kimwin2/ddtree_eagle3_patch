@@ -41,45 +41,31 @@ def _model_bytes(module) -> int:
     return int(total)
 
 
-def _effective_draft_bytes(module, quant_class_name, eff_bit):
-    """Theoretical *deployed* footprint of a LittleBit-quantized draft, in bytes.
+def _checkpoint_bytes(model_path) -> int:
+    """Deployed footprint of a model = the size of its weight files on disk, bytes.
 
-    The loaded checkpoint keeps full-precision latent weights (STE-style training
-    modules hold an fp32 weight that is binarized on the fly), so a plain
-    _model_bytes() would report a near-fp32 size — not the compressed footprint
-    that is the whole point of LittleBit. Here we instead report what the model
-    costs once deployed at its effective bit-width: each quantized linear's weight
-    matrix is counted at eff_bit/8 bytes per element, while everything else
-    (scales, biases, norms, embeddings, the LM head, ...) is counted at its native
-    dtype. Returns (effective_bytes, n_quant_weights, quant_bytes).
-
-    A module is treated as a quantized linear when its class name matches
-    quant_class_name; inside it, 2-D (weight-shaped) tensors are the quantized
-    weights and 1-D tensors (scales/bias) stay native.
+    This matches what `ls` shows and is the most honest "ROM": it reflects the
+    storage dtype (a bf16 checkpoint is half its fp32 in-memory size) and
+    quantization (a LittleBit checkpoint is already packed on disk), instead of
+    the fp32 size the demo happens to load into memory. Returns 0 when the path is
+    not a local directory (e.g. a bare HF hub id), so callers can fall back to
+    parameter accounting.
     """
-    if module is None:
-        return 0, 0, 0
-    total = 0
-    quant_bytes = 0
-    n_quant = 0
-    seen = set()
-    for sub in module.modules():
-        name = type(sub).__name__
-        is_quant = quant_class_name and (name == quant_class_name or quant_class_name in name)
-        for _, tensor in list(sub.named_parameters(recurse=False)) + list(
-            sub.named_buffers(recurse=False)
-        ):
-            if id(tensor) in seen:
-                continue
-            seen.add(id(tensor))
-            if is_quant and tensor.dim() >= 2:
-                bytes_ = int(tensor.numel() * eff_bit / 8)
-                quant_bytes += bytes_
-                n_quant += 1
-            else:
-                bytes_ = tensor.numel() * tensor.element_size()
-            total += bytes_
-    return int(total), n_quant, int(quant_bytes)
+    if not model_path or not os.path.isdir(model_path):
+        return 0
+
+    def _sum(ext):
+        return sum(
+            os.path.getsize(os.path.join(model_path, name))
+            for name in os.listdir(model_path)
+            if name.endswith(ext)
+        )
+
+    # Prefer safetensors; sharded checkpoints have several files that all match.
+    total = _sum(".safetensors")
+    if total == 0:
+        total = _sum(".bin") or _sum(".pt") or _sum(".pth")
+    return int(total)
 
 
 # Top-level stage keys per method (what sums to the decode time) plus, for
@@ -293,31 +279,22 @@ def worker_main(method, gpu_id, model_path, draft_path, tree_budget, in_q, out_q
                 on_commit=on_commit,
             )
 
-        # Static weight footprint ("ROM"). The target is identical across all
-        # methods (shared); only the draft adds to it. For the LittleBit draft we
-        # report the deployed (compressed) footprint rather than the fp32 latent
-        # size that is actually resident — see _effective_draft_bytes.
-        target_rom_bytes = _model_bytes(target)
-        if draft_type == "littlebit_dflash" and draft is not None:
-            draft_rom_bytes, n_quant, quant_bytes = _effective_draft_bytes(
-                draft, quant_mod, eff_bit
-            )
-            measured = _model_bytes(draft)
-            print(
-                f"[rom] method={method} draft deployed={draft_rom_bytes / 1e6:.1f} MB "
-                f"(quant_class={quant_mod} eff_bit={eff_bit} quant_weights={n_quant} "
-                f"quant={quant_bytes / 1e6:.1f} MB)  measured(latent)={measured / 1e6:.1f} MB",
-                flush=True,
-            )
-            if n_quant == 0:
-                print(
-                    f"[rom] WARNING method={method}: no modules matched quant_class "
-                    f"'{quant_mod}' — draft ROM fell back to the full latent size. "
-                    f"Check the quantized linear's class name.",
-                    flush=True,
-                )
-        else:
-            draft_rom_bytes = _model_bytes(draft)
+        # ROM = on-disk checkpoint size (the deployed/shippable footprint). This
+        # matches `ls`, reflects the storage dtype (bf16 on disk is half the fp32
+        # in-memory size) and quantization (a LittleBit checkpoint is already
+        # packed on disk), instead of the fp32 size the demo loads into memory.
+        # Falls back to in-memory parameter accounting when the weights are not a
+        # local directory (e.g. a bare HF hub id). The target is identical across
+        # all methods (shared); only the draft adds to it.
+        target_rom_bytes = _checkpoint_bytes(model_path) or _model_bytes(target)
+        draft_rom_bytes = _checkpoint_bytes(draft_path) or _model_bytes(draft)
+        print(
+            f"[rom] method={method} target={target_rom_bytes / 1e6:.1f} MB "
+            f"draft={draft_rom_bytes / 1e6:.1f} MB  "
+            f"(in-memory: target={_model_bytes(target) / 1e6:.1f} MB "
+            f"draft={_model_bytes(draft) / 1e6:.1f} MB)",
+            flush=True,
+        )
 
         # Warm up CUDA kernels / caches so the first real request is not penalised.
         warmup_ids = build_input_ids("Hello")

@@ -16,10 +16,13 @@ font is intentionally small so the speed gap is easy to feel.
 
 Each column also shows its memory footprint:
 
-- **ROM** — the static weight memory (parameters + buffers). The target is the
-  same model in every column (shared); the speculative columns show the draft's
-  extra weight as `+ draft`. Computed by parameter accounting, so it is exact and
-  reflects a low-bit / quantized draft honestly.
+- **ROM** — the deployed weight footprint, taken from the size of the model's
+  weight files on disk (matches `ls`). This reflects the storage dtype (a bf16
+  checkpoint is half its fp32 in-memory size) and quantization (a LittleBit
+  checkpoint is already packed on disk), rather than the fp32 size the demo loads
+  into memory. The target is the same model in every column (shared); the
+  speculative columns show the draft's extra weight as `+ draft`. Falls back to
+  in-memory parameter accounting when the weights are a bare HF hub id.
 - **RAM** — the live activation + KV-cache peak for the current request, measured
   as `max_memory_allocated()` above the at-rest (weights-only) level. This grows
   with sequence length and is larger for tree verification, so it differs per
