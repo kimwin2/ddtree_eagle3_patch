@@ -233,8 +233,7 @@ function run() {
       const meter = document.querySelector(`.card[data-method="${d.method}"] .meter > span`);
       meter.style.width = Math.min(100, (d.tokens / maxtokNum) * 100) + "%";
     } else if (d.event === "done") {
-      // Keep the streamed text; only finalize the live metrics. The text is
-      // unified across columns by the trailing "final" event.
+      // Keep the streamed text; only finalize the live metrics.
       q(d.method, "tps").textContent = `${d.tps} tok/s`;
       q(d.method, "tokens").textContent = d.tokens;
       const acc = q(d.method, "acc"); if (acc) acc.textContent = d.acc.toFixed(2);
@@ -247,10 +246,10 @@ function run() {
       out.classList.add("err");
       out.textContent = "Error:\n" + d.error;
     } else if (d.event === "final") {
-      // Snap every non-errored column to the identical canonical text.
+      // Snap every non-errored column to its OWN final text.
       for (const m of CONFIG.methods) {
         if (errored.has(m.key)) continue;
-        q(m.key, "out").textContent = d.text;
+        if (d.texts && d.texts[m.key] != null) q(m.key, "out").textContent = d.texts[m.key];
       }
       es.close();
       btn.disabled = false;

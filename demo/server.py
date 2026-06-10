@@ -99,14 +99,11 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
     with REGISTRY_LOCK:
         REGISTRY[req_id] = sink
 
-    # One shared "canonical" token sequence per request: whichever worker reaches
-    # a given position first fills it, and every column renders from this same
-    # sequence. At temperature 0 the three methods are meant to be identical, so
-    # unifying the displayed text hides the tiny floating-point argmax drift while
-    # each column still advances at its own real, measured speed.
-    canonical = {"ids": []}
+    # Each column renders its OWN committed tokens independently. At temperature 0
+    # the three methods are usually identical anyway (modulo tiny float argmax
+    # drift), which now shows up honestly per column instead of being unified.
     state = {
-        key: {"text": "", "count": 0, "t0": None, "acc_sum": 0.0, "acc_rounds": 0}
+        key: {"text": "", "count": 0, "t0": None, "acc_sum": 0.0, "acc_rounds": 0, "ids": []}
         for key in METHODS
     }
     errored = set()
@@ -142,18 +139,11 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
                 if event["type"] == "token":
                     if st["t0"] is None:
                         st["t0"] = time.time()
-                    ids = event["ids"]
-                    old_count = st["count"]
-                    new_count = old_count + len(ids)
-                    # Extend the shared canonical sequence if this worker is the
-                    # furthest ahead (canonical length >= every method's count).
-                    seen = len(canonical["ids"])
-                    if new_count > seen:
-                        canonical["ids"].extend(ids[seen - old_count :])
-                    st["count"] = new_count
+                    st["ids"].extend(event["ids"])
+                    st["count"] = len(st["ids"])
                     st["acc_sum"] += float(event["acc"])
                     st["acc_rounds"] += 1
-                    full = TOKENIZER.decode(canonical["ids"][:new_count], skip_special_tokens=True)
+                    full = TOKENIZER.decode(st["ids"], skip_special_tokens=True)
                     delta = full[len(st["text"]) :]
                     st["text"] = full
                     elapsed = max(time.time() - st["t0"], 1e-6)
@@ -186,9 +176,12 @@ def stream(request: Request, prompt: str, max_new_tokens: int = None, temperatur
                     errored.add(method)
                     yield sse({"event": "error", "method": method, "error": event["error"]})
 
-            # Snap every (non-errored) column to the identical final text.
-            final_text = TOKENIZER.decode(canonical["ids"], skip_special_tokens=True)
-            yield sse({"event": "final", "text": final_text, "errored": sorted(errored)})
+            # Send each (non-errored) column its OWN final text.
+            yield sse({
+                "event": "final",
+                "texts": {key: state[key]["text"] for key in METHODS},
+                "errored": sorted(errored),
+            })
         finally:
             with REGISTRY_LOCK:
                 REGISTRY.pop(req_id, None)
